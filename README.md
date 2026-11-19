@@ -1,10 +1,8 @@
 # teh
 
-**t**oken **e**fficient **h**arness: a minimal LLM agent in one Python file, with no dependencies. The name is also a nod to Singapore's *teh*.
+token efficient harness: a minimal LLM agent in one Python file, with no dependencies. The name is also a nod to Singapore's *teh*.
 
 You give it a task; the model gets one tool, your shell, and runs commands until the task is done, asking you before each one. It works with Anthropic's API and any OpenAI-compatible API (about 30 providers built in), on Linux, macOS and Windows, and shows exactly how many tokens each reply costs.
-
-`teh.py` has three roles: **the harness** (`teh.py ["task"]`), **a web helper** (`teh.py --fetch URL [word ...]`) that reads web pages as plain text, and **an edit helper** (`teh.py --edit FILE`) that applies exact search-and-replace edits. The model uses both helpers through the shell, as `teh-fetch` and `teh-edit`, so it still has a single tool.
 
 ## How it saves tokens
 
@@ -172,21 +170,6 @@ Reading the key from a file (or a password manager, `$(pass show anthropic)`) ke
 
 On Windows, set variables the way your shell does: `$env:TEH_MODEL = "claude-opus-5-5"` in PowerShell, `set TEH_MODEL=claude-opus-5-5` in cmd, then run `py teh.py`.
 
-## The web helper on its own
-
-```sh
-teh --fetch https://pypi.org/project/requests/ version                 # lines containing "version"
-teh --fetch https://docs.python.org/3/library/json.html dumps loads    # lines containing either word
-teh --fetch https://github.com/python/cpython                          # the start of the README
-teh --fetch -H "Authorization: Bearer $TOKEN" https://api.github.com/user/repos name   # a header
-teh --fetch --json '{"q": "teh"}' https://api.example.com/search                     # a JSON POST
-teh --fetch -X DELETE https://api.example.com/items/7                                # any method
-```
-
----
-
-# Reference
-
 ## Settings
 
 | Variable | Default | Meaning |
@@ -338,7 +321,7 @@ In PowerShell, pipe the blocks in with a here-string (`@'…'@ | teh-edit FILE`)
 The model reads the web only through the helper; the system prompt rules out `curl`, `wget` and similar. The model runs it as `teh-fetch`: a tiny launcher for `teh.py --fetch` in the scratch folder, which is put first on the search path for its commands. A short name saves tokens in every call that uses it, and in the conversation afterwards. On Windows the launcher is a `.cmd` file. In PowerShell, which would drop the quotes around an address with `&` in it when running a `.cmd` file, `teh` instead adds a `teh-fetch` function to each command, so such addresses arrive intact. The helper writes UTF-8 whenever its output isn't a terminal, so non-English pages come through correctly on Windows too. (These Windows paths haven't been tested on Windows itself.)
 
 - **Text, not HTML:** scripts, styles, menus and page chrome are removed; headings, lists and code blocks are kept. Links become `[3]`, listed once at the end.
-- **Only what's asked for:** with words, the lines containing any of them, numbered, with context; without, the start of the page. The full text is saved in the scratch folder (or a `teh-fetch` temp folder when run on its own), for `grep` or `sed`.
+- **Only what's asked for:** with words, the lines containing any of them, numbered, with context; without, the start of the page. The full text is saved in the scratch folder, for `grep` or `sed`.
 - **Cleaner sources first** (the `WEB_REWRITES` table, one line per site):
   - GitHub: raw files and READMEs
   - PyPI, npm and crates.io: their JSON APIs
@@ -367,13 +350,13 @@ The model reads the web only through the helper; the system prompt rules out `cu
 
 ## Searching
 
-General web search engines don't work for a program that's honest about what it is. Tested from Python's standard library with the helper's own user agent: DuckDuckGo and Mojeek answer with a bot challenge, Brave with HTTP 429, and Google with a page that needs JavaScript. Bing answers, but with results unrelated to the query (for "python 3.14 release notes", pages about colonization for children), which is worse than no answer. So the helper searches sources that offer a free, official search API instead, with no key:
+General web search engines don't work for a program that's honest about what it is. Tested from Python's standard library with the helper's own user agent: DuckDuckGo and Mojeek answer with a bot challenge, Brave with HTTP 429, and Google with a page that needs JavaScript. Bing answers, but with results unrelated to the query (for "python 3.14 release notes", pages about colonization for children), which is worse than no answer. So the helper searches sources that offer a free, official search API instead, with no key. The model runs searches like these:
 
 ```sh
-teh --fetch --search wikipedia fusion energy
-teh --fetch --search stackexchange:cooking sourdough starter     # SOURCE:OPTION, here a Stack Exchange site
-teh --fetch --search github:issues tokio select cancel
-teh --fetch --search                                              # every source, what it covers, and its limit
+teh-fetch --search wikipedia fusion energy
+teh-fetch --search stackexchange:cooking sourdough starter     # SOURCE:OPTION, here a Stack Exchange site
+teh-fetch --search github:issues tokio select cancel
+teh-fetch --search                                              # every source, what it covers, and its limit
 ```
 
 Each result is three lines: title, link and details (e.g. votes and answers, stars, authors and date), so 8 results cost a few hundred tokens. The API's full response is saved for `grep`, and the model reads a result with `teh-fetch URL`. The model is told the source names in the system prompt, and that general search engines don't work, so it doesn't spend calls on them.
@@ -537,6 +520,8 @@ tests/unix/run.sh --changed    # only the suites affected by what changed since 
 cd tests && python3 -m unittest test_units   # the unit tests alone, on any system
 ```
 
+GitHub Actions runs every suite on each push and pull request, on Linux with Python 3.10, 3.12 and 3.14 (`.github/workflows/tests.yml`).
+
 `tests/` holds what every system shares: the unit tests (`test_units.py`, plain Python) and the fake API servers (`fakes/`). Each system's own suites, which drive `teh` through its shell and terminal, live in a folder of their own: `tests/unix/` (bash, and a pseudo-terminal for chat) so far. See `tests/README.md` for the layout, and for adding Windows suites.
 
 **`--changed`** skips a suite when nothing it depends on has changed since it last passed. That's `teh.py` (all of it for `core` and `fetch`, which test the web helper too; for the others, everything before Part 2), the suite's test script, the fake servers it starts, and the shared helpers. Comments don't count, so a comment-only edit reruns nothing; an edit to the web helper reruns `core` and `fetch` only. The unit tests always run, as they take under a second, and a failing one is shown in full. Each pass is recorded in `tests/unix/.passed` (delete it to start over). The dependencies are listed in `tests/unix/inputs.py`; a missing one could let a breaking change skip a suite, so run everything before you finish.
@@ -555,6 +540,10 @@ The tests use fake API servers on your machine (`tests/fakes/`): no API key, no 
 | `output` | Exit codes, `TEH_OUTPUT=json`, multi-line prompts |
 | `compact` | Automatic compaction when the window is full, `/compact` in chat, the summary request, kept requests, the transcript, failures |
 | `fetch` | The web helper, offline: text extraction, hidden-text removal, safety, JSON, word search, request options (headers, methods, bodies, API errors); search is covered by `units`, with canned API answers |
+
+## Acknowledgements
+
+teh c kosong peng
 
 ## License
 

@@ -1,0 +1,25 @@
+# Runs every test suite on each push and pull request. The suites need no API key and no network: teh is pointed at
+# fake API servers on localhost (tests/fakes/).
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unix:
+    name: tests (Linux, Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Tools the suites use
+        run: sudo apt-get install -y --no-install-recommends bc
+      - name: Unit tests and the Unix suites
+        run: bash tests/unix/run.sh
