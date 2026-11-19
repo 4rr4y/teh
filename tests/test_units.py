@@ -1245,25 +1245,32 @@ class Search(unittest.TestCase):
             self.search(["npm", "x"], '{"error": "no results key"}')
         self.assertIn("search failed: npm", str(e.exception))
 
+    def sleeps(self):  # -> the waits pace asks for, recorded instead of slept: timing a slow runner would be flaky
+        from unittest import mock
+        waits = []
+        patch = mock.patch.object(h.time, "sleep", waits.append)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return waits
+
     def test_pace_keeps_requests_apart(self):
-        import time
-        start = time.monotonic()
-        h.pace("test", 0.3)
-        h.pace("test", 0.3)  # waits for the first one's 0.3s
-        self.assertGreaterEqual(time.monotonic() - start, 0.25)
-        start = time.monotonic()
+        waits = self.sleeps()
+        h.pace("test", 0.3)  # the first: no wait
+        self.assertEqual(waits, [])
+        h.pace("test", 0.3)  # waits for what's left of the first one's 0.3s
+        self.assertEqual(len(waits), 1)
+        self.assertTrue(0 < waits[0] <= 0.3, waits)
         h.pace("other", 0.3)  # each source on its own
-        self.assertLess(time.monotonic() - start, 0.2)
+        self.assertEqual(len(waits), 1)
 
     def test_fetching_from_a_search_source_keeps_to_its_limit(self):  # openfda: 0.25s between requests
-        import time
-        start = time.monotonic()
+        waits = self.sleeps()
         h.pace("openfda", 0.25)                                           # a search ...
         h.pace_host("https://api.fda.gov/drug/label.json?search=set_id:x")  # ... then fetching one of its results
-        self.assertGreaterEqual(time.monotonic() - start, 0.2)
-        start = time.monotonic()
+        self.assertEqual(len(waits), 1)
+        self.assertTrue(0 < waits[0] <= 0.25, waits)
         h.pace_host("https://example.com/")                               # another site: no wait
-        self.assertLess(time.monotonic() - start, 0.1)
+        self.assertEqual(len(waits), 1)
 
     def test_contact_only_to_sites_that_ask_for_it(self):  # whatever WEB_CONTACT is set to in teh.py
         self.addCleanup(setattr, h, "WEB_CONTACT", h.WEB_CONTACT)

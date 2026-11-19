@@ -11,8 +11,8 @@ jobs:
     name: lint (ruff)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
       # The same version as locally (requirements-dev.txt), so a check that passes there passes here
@@ -29,8 +29,8 @@ jobs:
       matrix:
         python: ["3.10", "3.12", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - name: Unit tests and the suites, in bash and sh
@@ -44,8 +44,8 @@ jobs:
       matrix:
         python: ["3.10", "3.12", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       # Only Python is needed. The suites run the model's commands in cmd, Windows PowerShell and PowerShell 7 (pwsh),
