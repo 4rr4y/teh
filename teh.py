@@ -181,13 +181,12 @@ LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
 def is_local(host):
     """This machine or a private network: a server someone runs themselves."""
-    if host in LOCAL_HOSTS or host.endswith((".localhost", ".local", ".internal")) or "." not in host:
-        return True
+    # An IP address first: an IPv6 one has no dots, so it would pass the single-label check below
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
-        return False
-    return address.is_private or address.is_loopback or address.is_link_local
+        return host in LOCAL_HOSTS or host.endswith((".localhost", ".local", ".internal")) or "." not in host
+    return address.is_private or address.is_loopback or address.is_link_local or address.is_unspecified
 
 def server(url):
     """Return the (host, port) a URL points to, with every way of writing this machine as "localhost".
@@ -591,9 +590,15 @@ POWERSHELL_RUN = ("$global:TEH_OK = $true; $global:LASTEXITCODE = 0; function te
                   "if ({helper_last} -and $LASTEXITCODE) {{ exit $LASTEXITCODE }}; "
                   "if (-not $TEH_OK) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}")
 
+# PowerShell strings, whose ; | and line breaks don't end a statement: here-strings (their content can hold any quote),
+# then single-quoted ('' is a quote, read as two strings in a row) and double-quoted (` escapes the next character)
+POWERSHELL_STRINGS = re.compile(r"""@'[ \t]*\r?\n.*?\n'@|@"[ \t]*\r?\n.*?\n"@|'[^']*'|"(?:[^"`]|`.)*\"""",
+                                re.DOTALL)
+
 def helper_last(cmd):
     """Whether a PowerShell command's last statement runs a helper (a best guess, from the text)."""
-    last = re.split(r"[;|\n]", cmd.strip())[-1].strip()
+    # Strings emptied first, so a ; or | inside one (an address, an edit block) isn't taken for a separator
+    last = re.split(r"[;|\n]|&&", POWERSHELL_STRINGS.sub("''", cmd.strip()))[-1].strip()
     return last.split(" ", 1)[0] in HELPERS
 
 def utf16_base64(text):
@@ -1068,11 +1073,50 @@ def shell_argv(session, cmd):
         return [env.shell, "-NoProfile", "-NonInteractive", "-Command", POWERSHELL_RUN.format(
             prelude=utf16_base64(env.prelude), cmd=utf16_base64(cmd + "\n$global:TEH_OK = $?"),
             helper_last="$true" if helper_last(cmd) else "$false")]
-    # cmd parses its raw command line itself, so pass a string (as shell=True does)
+    # cmd parses its raw command line itself, so pass a string (as shell=True does). A command line ends at its first
+    # line break, so a command of several lines would run only its first line, and report that line's exit code: it
+    # runs as a batch file instead (in the scratch folder, replaced by the next one), which runs every line, with its
+    # % signs written as a batch file needs them to mean what they mean on a command line (see batch_percents)
     if env.shell_kind == "cmd":
+        if "\n" in cmd.strip():
+            script = Path(env.scratch, "command.cmd")
+            lines = batch_percents(cmd.strip().replace("\r\n", "\n"), env.command_env).split("\n")
+            # CRLF: cmd misreads labels and goto in a batch file with bare LF line endings
+            script.write_text("@echo off\r\n" + "\r\n".join(lines) + "\r\n", encoding="utf-8", newline="")
+            cmd = f'"{script}"'
         return f'"{env.shell}" /d /s /c "{cmd}"'
     # Everything else: bash, zsh, sh, dash, fish, ...
     return [env.shell, "-c", cmd]
+
+# cmd's variables that are always defined, though not in the environment
+CMD_DYNAMIC = {"CD", "DATE", "TIME", "RANDOM", "ERRORLEVEL", "CMDEXTVERSION", "CMDCMDLINE", "HIGHESTNUMANODENUMBER",
+               "__CD__", "__APPDIR__"}
+# A variable reference, %NAME% or with a substring or substitution, %NAME:~0,5% or %NAME:a=b%
+CMD_VARIABLE = re.compile(r"%([^%:\s]+)(?::[^%\r\n]*)?%")
+# A `set` in the script: the variable it defines (set NAME=, set "NAME=", set /a NAME+=, set /p NAME=)
+CMD_SET = re.compile(r"""\bset\s+(?:/[ap]\s+)?"?([^=\s"+\-*/%&|^<>!]+)""", re.IGNORECASE)
+
+def batch_percents(script, environ):
+    """Return a script of several cmd lines with its % signs as a batch file needs them to act as on a command line.
+
+    On a command line, %NAME% is the variable's value when it's defined and stays as it is when not, and any other %
+    is just a %: in 100%, in an address's %20, and in a for loop's %i. In a batch file, a lone % is dropped, %1 is an
+    argument, an undefined %NAME% is empty, and a for loop needs %%i. So every % is doubled (%% is one %, and %%i a
+    for loop's variable), except in references to the variables that are defined: in the environment the command
+    starts with, cmd's own (CMD_DYNAMIC), and those the script sets itself.
+    """
+    defined = {name.upper() for name in environ} | CMD_DYNAMIC | {m.upper() for m in CMD_SET.findall(script)}
+    out, i = [], 0
+    while (at := script.find("%", i)) >= 0:
+        out.append(script[i:at])
+        ref = CMD_VARIABLE.match(script, at)
+        if ref and ref.group(1).upper() in defined:
+            out.append(ref.group())
+            i = ref.end()
+        else:
+            out.append("%%")
+            i = at + 1
+    return "".join(out) + script[i:]
 
 def stop(p):
     """Stop a command and everything it started."""
@@ -2454,23 +2498,26 @@ EDIT_MARKERS = ("<<<<<<< SEARCH", "=======", ">>>>>>> REPLACE")
 EDIT_SHOWN = 12
 
 def edit_blocks(text):
-    """Parse the blocks given on stdin into [(search, replace)]; ValueError when there are none, or one is cut off."""
-    # part: the lines being read (search, or replace), or None between blocks
-    blocks, part, search, replace = [], None, [], []
+    """Parse the blocks given on stdin; ValueError when there are none, or one is cut off.
+
+    Returns, for each block, the ways it can be read: [(search, replace)]. Usually one; but a ======= line can be
+    part of the text too (a Markdown or reStructuredText heading's underline, a Git conflict), and then each such line
+    could be the one that ends SEARCH. Which one is meant is settled against the file (see apply_block).
+    """
+    # lines: the block being read (between its SEARCH and REPLACE lines), or None between blocks
+    blocks, lines = [], None
     for line in text.replace("\r\n", "\n").split("\n"):
         marker = line.strip()
-        if marker == EDIT_MARKERS[0] and part is None:
-            search, replace = [], []
-            part = search
-        elif marker == EDIT_MARKERS[1] and part is search:
-            part = replace
-        elif marker == EDIT_MARKERS[2] and part is replace:
-            blocks.append(("\n".join(search), "\n".join(replace)))
-            part = None
-        elif part is not None:
-            part.append(line)
+        if marker == EDIT_MARKERS[0] and lines is None:
+            lines = []
+        elif marker == EDIT_MARKERS[2] and lines is not None and EDIT_MARKERS[1] in map(str.strip, lines):
+            blocks.append([("\n".join(lines[:i]), "\n".join(lines[i + 1:]))
+                           for i, sep in enumerate(lines) if sep.strip() == EDIT_MARKERS[1]])
+            lines = None
+        elif lines is not None:
+            lines.append(line)
     # Lines outside blocks were ignored
-    if part is not None:
+    if lines is not None:
         raise ValueError(f"the last block isn't finished: it needs a {EDIT_MARKERS[1]} line and a "
                          f"{EDIT_MARKERS[2]} line")
     if not blocks:
@@ -2565,6 +2612,25 @@ def apply_edit(text, search, replace):
     raise LookupError(f"SEARCH found {count} times (lines {', '.join(map(str, at[:10]))}): add lines around it so "
                       "it's found once")
 
+def apply_block(text, readings):
+    """Apply one block, given the ways it can be read (see edit_blocks); return as apply_edit does.
+
+    With several readings (more than one ======= line), the one with the longest SEARCH that applies wins. Each
+    reading's SEARCH starts the next one's, so a shorter one is found wherever a longer one is: in a file with
+    "Title / ======= / old" (a heading), SEARCH "Title" would be found too, and its REPLACE would write the rest of the
+    real SEARCH into the file. The longest is wrong only if REPLACE starts with exactly the lines that follow SEARCH
+    in the file, which no edit means. Raises LookupError, saying why, when none applies.
+    """
+    if len(readings) == 1:
+        return apply_edit(text, *readings[0])
+    # Longest SEARCH first; an empty one only creates a file
+    for search, replace in reversed(readings):
+        if search:
+            with contextlib.suppress(LookupError):
+                return apply_edit(text, search, replace)
+    raise LookupError(f"SEARCH not found, with any of its {len(readings)} {EDIT_MARKERS[1]} lines taken as the one "
+                      "that ends it" + closest_lines(text, readings[0][0]))
+
 def edit_main(args):
     """Run the edit helper: teh.py --edit FILE < BLOCKS; return the exit code."""
     if len(args) != 1:
@@ -2578,10 +2644,11 @@ def edit_main(args):
         raise SystemExit(f"not edited: {e}") from None
     # A new file: one block, with an empty SEARCH
     if not path.exists():
-        if len(blocks) != 1 or blocks[0][0]:
+        # The first reading: an empty SEARCH ends at the first ======= line, and the new file may have others
+        if len(blocks) != 1 or blocks[0][0][0]:
             raise SystemExit(f"not edited: {path} doesn't exist (to create it, give one block with an empty SEARCH)")
         path.parent.mkdir(parents=True, exist_ok=True)
-        new = blocks[0][1]
+        new = blocks[0][0][1]
         path.write_text(new if new.endswith("\n") or not new else new + "\n", encoding="utf-8")
         lines = new.rstrip("\n").count("\n") + 1
         print(f"created {path} ({lines:,} line{'s' * (lines != 1)})")
@@ -2595,14 +2662,14 @@ def edit_main(args):
     # Windows line endings: blocks use them too, so they match and stay as they were
     crlf = "\r\n" in text
     applied, loose, problems = [], [], []
-    for n, (search, replace) in enumerate(blocks, 1):
+    for n, readings in enumerate(blocks, 1):
         if crlf:
-            search, replace = search.replace("\n", "\r\n"), replace.replace("\n", "\r\n")
-        if not search:
+            readings = [(s.replace("\n", "\r\n"), r.replace("\n", "\r\n")) for s, r in readings]
+        if len(readings) == 1 and not readings[0][0]:
             problems.append(f"block {n}: SEARCH is empty, which only creates a new file; {path} exists")
             continue
         try:
-            text, line, whitespace_only = apply_edit(text, search, replace)
+            text, line, whitespace_only = apply_block(text, readings)
             applied.append(line)
             if whitespace_only:
                 loose.append(line)

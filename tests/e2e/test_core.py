@@ -135,6 +135,9 @@ COMMANDS = {
         "helper_mid": "teh-fetch & echo after",
         "tidy": run_py("cmd", "tidy.py"),
         "silent": "ver >nul",
+        # Several lines run as a batch file: every line, % as on a command line (a for loop's %i, a literal %, an
+        # address's %20), a variable set on one line used on the next, and the last line's exit code
+        "multiline": "echo one\nfor %i in (two) do @echo %i\nset N=5\necho 100%% a%20b %N%\nexit /b 3",
     },
     "powershell": {
         "quote": 'Write-Output "it\'s ""quoted"""; exit 3',
@@ -160,6 +163,7 @@ COMMANDS = {
         "helper_mid": 'teh-fetch; "after"',
         "tidy": run_py("powershell", "tidy.py"),
         "silent": "$null = 1",
+        "multiline": '"one"\n"two"\nexit 3',
         "error": 'Get-Content nosuch.txt; "after"',
         "error_last": "Write-Error 'it broke'",
     },
@@ -183,6 +187,7 @@ COMMANDS = {
         "helper_mid": "teh-fetch; echo after",
         "tidy": run_py("bash", "tidy.py"),
         "silent": "true",
+        "multiline": "echo one\necho two\nexit 3",
     }}
 PROJECT_FILES = ["bad.txt", "blocks.txt", "f.py", "tidy.py", "u.txt", "ublocks.txt"]
 
@@ -203,6 +208,10 @@ for n, sh in enumerate(SHELLS):
                                       "TEH_SHELL": sh, "TEH_API_KEY": "sk-SECRET", "TEH_EFFORT": "low"})
     res = {k: s.results(log).get(i + 1, "") for i, k in enumerate(keys)}
     s.check(f"{sh}: the run finishes, every command answered", r.code == 0 and all(res.values()))
+    s.check(f"{sh}: a command of several lines runs every line, with the last line's exit code",
+            re.search(r"one\s*\n\s*two", res["multiline"]) is not None and "[exit 3]" in res["multiline"])
+    if family(sh) == "cmd":
+        s.check("cmd: several lines: % as on a command line", "100%% a%20b 5" in res["multiline"])
     s.check(f"{sh}: quoting intact, and the exit code", 'it\'s "quoted"' in res["quote"] and "[exit 3]" in res["quote"])
     s.check(f"{sh}: commands see TEH_SCRATCH, not the key or other settings",
             "TEH_SCRATCH" in res["env"] and not re.search(r"TEH_(API_KEY|EFFORT|MODEL|BASE_URL|AUTO|SHELL)", res["env"])

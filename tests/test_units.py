@@ -115,6 +115,8 @@ class Settings(unittest.TestCase):
                            ("http://localhost:11434/v1", "ollama"), ("http://127.0.0.1:1234/v1", "lmstudio"),
                            ("http://localhost:8080/v1", "custom"), ("http://192.168.1.20:8000/v1", "custom"),
                            ("http://gpu-box:5000/v1", "custom"), ("http://[::1]:9000", "custom"),
+                           ("http://[fd00::5]:8000/v1", "custom"),  # a private IPv6 address
+                           ("http://[2606:4700::1]/v1", "2606:4700::1"),  # a public one: no dots, but not local
                            ("https://llm.example.com/v1", "llm.example.com")]:
             self.assertEqual(h.provider_name(base), name, base)
         configure(TEH_BASE_URL="groq")
@@ -236,10 +238,25 @@ class Harness(unittest.TestCase):
         self.assertEqual(blocks, [prelude, 'teh-fetch "https://e.com/?a=1&b=2" word\n$global:TEH_OK = $?'])
         self.assertIn("if ($true -and $LASTEXITCODE) { exit $LASTEXITCODE }", argv[4])  # the helper is last
 
+    def test_batch_percents(self):  # cmd, several lines: a batch file, with % signs meaning what they do on one line
+        environ = {"Path": "x", "TEHVAR": "v"}
+        for line, batch in [("echo 100%", "echo 100%%"), ("echo a%20b%E2%82%AC", "echo a%%20b%%E2%%82%%AC"),
+                            ("echo %PATH% %tehvar:~0,1% %TEHVAR:v=w%", "echo %PATH% %tehvar:~0,1% %TEHVAR:v=w%"),
+                            ("echo %NOPE% %1 %%", "echo %%NOPE%% %%1 %%%%"),  # undefined: as typed, as on one line
+                            ("for %i in (a) do @echo %~nxi", "for %%i in (a) do @echo %%~nxi"),
+                            ("echo %CD% %ERRORLEVEL%", "echo %CD% %ERRORLEVEL%"),
+                            ('set /a N+=1\nset "Q=1"\necho %N% %Q%', 'set /a N+=1\nset "Q=1"\necho %N% %Q%'),
+                            ("echo a%TEHVAR b%", "echo a%%TEHVAR b%%"), ("echo none", "echo none")]:
+            self.assertEqual(h.batch_percents(line, environ), batch, line)
+
     def test_helper_last(self):  # PowerShell: whether a helper's exit code is the command's
         for cmd, last in [("teh-fetch https://e.com", True), ("@'\nblock\n'@ | teh-edit f.py", True),
                           ('teh-fetch x; "after"', False), ("Get-Content f | teh-edit g.py\n", True),
-                          ("teh-fetchy x", False), ("Get-Content teh-edit", False)]:
+                          ("teh-fetchy x", False), ("Get-Content teh-edit", False),
+                          # A ; or | inside a string isn't a separator: the helper is still last
+                          ('teh-fetch "https://e.com/?a=1;b=2"', True), ("teh-fetch 'x|y' word", True),
+                          ("@'\nx = 'a'; y | z\n'@ | teh-edit f.py", True), ('teh-fetch "a`"b;c"', True),
+                          ("Set-Location src && teh-edit f.py", True), ('teh-edit f.py; "a;b"', False)]:
             self.assertEqual(h.helper_last(cmd), last, cmd)
 
     def test_decode(self):  # command output and helpers' stdin: UTF-8, else (on Windows) the ANSI code page
@@ -454,6 +471,8 @@ class SystemPrompt(unittest.TestCase):
             for advice in ("read only what you need", "over many rows of data (CSV, logs, tables), write a script",
                            "prose and code still need reading", "in replies, don't repeat file contents"):
                 self.assertIn(advice, prompt, kind)
+            # cmd's several lines run as a batch file, but with a command line's % signs: nothing to tell the model
+            self.assertNotIn("%%i", prompt, kind)
             for skimming in ("check sizes", "print little", "in parts"):  # made the model miss details: left out
                 self.assertNotIn(skimming, prompt, kind)
             parallel = {"bash": "& wait)", "zsh": "& wait)", "pwsh": "$j | Wait-Job)", "powershell": "Start-Job {"}
@@ -767,10 +786,32 @@ class EditHelper(unittest.TestCase):  # teh.py --edit FILE < BLOCKS (teh-edit)
     def test_blocks(self):
         blocks = h.edit_blocks("talk outside blocks is ignored\r\n" + self.BLOCK.format("a\nb", "") +
                                self.BLOCK.format("c", "d\n\ne"))
-        self.assertEqual(blocks, [("a\nb", ""), ("c", "d\n\ne")])  # a deletion; blank lines kept; CRLF on stdin
-        for bad in ("no blocks at all", "<<<<<<< SEARCH\nx\n=======\ny\n"):
+        self.assertEqual(blocks, [[("a\nb", "")], [("c", "d\n\ne")]])  # a deletion; blank lines kept; CRLF on stdin
+        # A ======= line in the text: each such line could end SEARCH, so every reading is kept
+        self.assertEqual(h.edit_blocks(self.BLOCK.format("Title\n=======", "Name\n=======")),
+                         [[("Title", "=======\nName\n======="), ("Title\n=======", "Name\n======="),
+                           ("Title\n=======\n=======\nName", "")]])
+        for bad in ("no blocks at all", "<<<<<<< SEARCH\nx\n=======\ny\n", "<<<<<<< SEARCH\nx\n>>>>>>> REPLACE\n"):
             with self.assertRaises(ValueError):
                 h.edit_blocks(bad)
+
+    def test_separator_lines_in_the_text(self):  # a Markdown heading's underline once cut SEARCH short, silently
+        path = self.file("Intro\n=======\n\nTitle\n=======\nold text\n")
+        code, out = self.edit(path, ("Title\n=======\nold text", "Title\n=======\nnew text"))
+        self.assertEqual((code, path.read_text()), (0, "Intro\n=======\n\nTitle\n=======\nnew text\n"), out)
+        # The ======= line in REPLACE only: the one ending SEARCH is still the first, as SEARCH has none
+        path = self.file("Title\nold\n")
+        code, out = self.edit(path, ("Title\nold", "Title\n=======\nnew"))
+        self.assertEqual((code, path.read_text()), (0, "Title\n=======\nnew\n"), out)
+        # No reading fits: said so, and the file is unchanged
+        path = self.file("a\n=======\nb\n")
+        code, out = self.edit(path, ("x\n=======\ny", "z"))
+        self.assertEqual((code, path.read_text()), (1, "a\n=======\nb\n"))
+        self.assertIn("block 1: SEARCH not found, with any of its 2 ======= lines taken as the one that ends it", out)
+        # A new file may have ======= lines: its SEARCH is empty, so it ends at the first
+        new = Path(self.file("").parent, "new.md")
+        code, out = self.edit(new, ("", "Title\n=======\ntext"))
+        self.assertEqual((code, new.read_text()), (0, "Title\n=======\ntext\n"), out)
 
     def test_apply(self):
         self.assertEqual(h.apply_edit("a\nb\nc\n", "b", "B"), ("a\nB\nc\n", 2, False))  # new text, line, loose?
