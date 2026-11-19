@@ -609,12 +609,22 @@ class Budgets(unittest.TestCase):  # TEH_TOKEN_BUDGET (per run) and TEH_TURN_BUD
                       line(TEH_TOKEN_BUDGET="50000", TEH_TURN_BUDGET="40"))
 
 class ModelAndEffort(unittest.TestCase):  # /model and /effort: switched mid-chat, typos refused with a message
-    def run_command(self, command, arg, msgs=None):  # -> (what it printed, its dim lines)
+    def run_command(self, command, arg, msgs=None, typed=()):  # -> (what it printed, its dim lines)
         import contextlib
         import io
+        from unittest import mock
         out, err = io.StringIO(), io.StringIO()
         session.msgs = msgs or []
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        # typed: the answers to its questions (the /model picker's); EOFError once they run out, as at Ctrl+D
+        answers = iter(typed)
+        def type_answer(prompt=""):
+            print(prompt, end="")
+            try:
+                return next(answers)
+            except StopIteration:
+                raise EOFError from None
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                mock.patch("builtins.input", type_answer):
             h.CHAT_COMMANDS[command](session, arg)
         return out.getvalue(), err.getvalue()
 
@@ -633,30 +643,117 @@ class ModelAndEffort(unittest.TestCase):  # /model and /effort: switched mid-cha
         configure(TEH_EFFORT=" Low ")
         self.assertEqual(session.state.effort, "low")
 
+    def list_models(self, models):  # /model sees these as the provider's list ({id: context window or None})
+        self.addCleanup(setattr, h, "available_models", h.available_models)
+        h.available_models = lambda session: models
+
     def test_model_switch(self):
         configure(TEH_THINKING="500")
-        self.addCleanup(setattr, h, "available_models", h.available_models)
-        h.available_models = lambda session: {"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"}
+        self.list_models({"claude-opus-5-5": None, "claude-sonnet-5-5": None, "claude-haiku-5-5": None})
         out, err = self.run_command("/model", "claude-sonnet-5-5")  # an empty chat: no cache to lose
         self.assertEqual((session.state.model, out), ("claude-sonnet-5-5", ""))
         self.assertEqual(err, "· anthropic · claude-sonnet-5-5 · default · Σ 0 · ctx 0/262,144 (0%)\n")
         self.assertTrue(session.state.summarize)  # follows the model
-        out, err = self.run_command("/model", "claude-sonet-5-5")  # a typo: refused, with the closest names
-        self.assertEqual((session.state.model, err), ("claude-sonnet-5-5", ""))
-        self.assertIn("unknown model 'claude-sonet-5-5': it isn't among the 3 models https://api.anthropic.com/v1 "
-                      "lists; did you mean claude-sonnet-5-5", out)
         out, err = self.run_command("/model", "claude-haiku-5-5", [{"role": "user", "content": "hi"}])
         self.assertIn("· the prompt cache is per model: the next call reads the conversation at full price", err)
         self.assertEqual(session.state.model, "claude-haiku-5-5")
 
+    def test_model_picker(self):
+        configure()
+        self.list_models({"claude-opus-5-5": 1_000_000, "claude-sonnet-5-5": 1_000_000, "claude-haiku-4-5": 200_000,
+                          "gpt-x": None})
+        # Part of an id: the models containing it, numbered, with their windows; the number picks one
+        out, err = self.run_command("/model", "SONNET", typed=["1"])
+        self.assertIn("1 of the 4 models https://api.anthropic.com/v1 lists contain 'SONNET':\n"
+                      "   1. claude-sonnet-5-5  1,000,000 context\npick a number (Enter to cancel): ", out)
+        self.assertEqual(session.state.model, "claude-sonnet-5-5")
+        # Nothing: all of them, sorted; a window the list doesn't give shows as ?
+        out, _ = self.run_command("/model", "", typed=["4"])
+        self.assertIn("4 of the 4 models", out)
+        self.assertRegex(out, r"1\. claude-haiku-4-5 +200,000 context\n.*\n.*\n +4\. gpt-x +\? context\n")
+        self.assertEqual(session.state.model, "gpt-x")
+        # A typo: none contains it, so the closest
+        out, _ = self.run_command("/model", "claude-sonet-5-5", typed=["1"])
+        self.assertIn("none of the 4 models https://api.anthropic.com/v1 lists contains 'claude-sonet-5-5'; the "
+                      "closest:\n   1. claude-sonnet-5-5", out)
+        self.assertEqual(session.state.model, "claude-sonnet-5-5")
+        # Enter, Ctrl+D or a wrong number: nothing changes, and no status line
+        for typed in ([""], [], ["9"], ["x"]):
+            out, err = self.run_command("/model", "claude", typed=typed)
+            self.assertEqual((session.state.model, err), ("claude-sonnet-5-5", ""))
+        self.assertIn("not a number from 1 to 3: nothing changed", out)
+        out, err = self.run_command("/model", "zzzz")
+        self.assertIn("none of the 4 models https://api.anthropic.com/v1 lists contains 'zzzz', or is close to it", out)
+        self.assertEqual(err, "")
+
+    def test_model_picker_lists_at_most_picker_max(self):
+        configure()
+        self.list_models({f"model-{n:03}": None for n in range(h.PICKER_MAX + 5)})
+        out, _ = self.run_command("/model", "model", typed=[str(h.PICKER_MAX + 1)])
+        self.assertIn(f"{h.PICKER_MAX:>4}. model-{h.PICKER_MAX - 1:03}", out)
+        self.assertIn("   … 5 more: narrow the list with /model <part of the id>", out)
+        self.assertIn(f"not a number from 1 to {h.PICKER_MAX}", out)
+
+    def test_context_window_follows_the_model(self):
+        # The model's own, less TEH_MAX_TOKENS for a reply, larger or smaller than TEH_CONTEXT_WINDOW; said when it
+        # changes
+        configure(TEH_CONTEXT_WINDOW="200000", TEH_MAX_TOKENS="16000")
+        self.list_models({"big": 1_000_000, "small": 128_000, "tiny": 20_000, "unknown": None})
+        _, err = self.run_command("/model", "small")
+        self.assertEqual(session.state.context_window, 112_000)
+        self.assertIn("· context window 200,000 → 112,000 (the model's 128,000, less 16,000 for a reply)\n", err)
+        self.assertIn("ctx 0/112,000", err)
+        _, err = self.run_command("/model", "big")
+        self.assertEqual(session.state.context_window, 984_000)
+        self.run_command("/model", "tiny")  # never less than half the model's own
+        self.assertEqual(session.state.context_window, 10_000)
+        _, err = self.run_command("/model", "unknown")  # a window the list doesn't give: TEH_CONTEXT_WINDOW
+        self.assertEqual(session.state.context_window, 200_000)
+        self.assertIn("· context window 10,000 → 200,000 (TEH_CONTEXT_WINDOW: the provider gives none for it)", err)
+        _, err = self.run_command("/model", "unknown")  # no change: nothing said
+        self.assertNotIn("context window", err)
+        # The current model, as part of an id: picked again to set its window, without a cache warning
+        configure(TEH_MODEL="small", TEH_CONTEXT_WINDOW="200000", TEH_MAX_TOKENS="16000")
+        _, err = self.run_command("/model", "sma", [{"role": "user", "content": "hi"}], typed=["1"])
+        self.assertEqual(session.state.context_window, 112_000)
+        self.assertNotIn("prompt cache", err)
+
+    def test_model_switch_refused_when_the_conversation_doesnt_fit(self):
+        configure(TEH_MODEL="big", TEH_CONTEXT_WINDOW="1000000", TEH_MAX_TOKENS="16000")
+        self.list_models({"big": 1_000_000, "small": 128_000})
+        session.state.context, session.state.pending = 100_000, 12_000  # what's pending counts too
+        out, err = self.run_command("/model", "small", [{"role": "user", "content": "hi"}])
+        self.assertEqual((session.state.model, session.state.context_window, err), ("big", 1_000_000, ""))
+        self.assertIn("not switched: the conversation (112,000 tokens) doesn't fit small's context window (112,000, "
+                      "the model's 128,000, less 16,000 for a reply). /compact it first, with the current model, or "
+                      "/clear to start fresh", out)
+        session.state.pending = 11_999  # it fits
+        self.run_command("/model", "small", [{"role": "user", "content": "hi"}])
+        self.assertEqual((session.state.model, session.state.context_window), ("small", 112_000))
+        # An empty conversation always fits (the context count is the last call's, until /clear resets it)
+        configure(TEH_MODEL="big", TEH_CONTEXT_WINDOW="1000000")
+        session.state.context = 500_000
+        self.run_command("/model", "small")
+        self.assertEqual(session.state.model, "small")
+        # Without a list: TEH_CONTEXT_WINDOW is the new window, refused just the same
+        configure(TEH_CONTEXT_WINDOW="50000")
+        self.list_models(None)
+        session.state.context = 60_000
+        out, _ = self.run_command("/model", "other", [{"role": "user", "content": "hi"}])
+        self.assertIn("doesn't fit other's context window (50,000, TEH_CONTEXT_WINDOW: the provider gives none for "
+                      "it)", out)
+
     def test_model_switch_when_the_provider_cant_say(self):
         configure()
-        self.addCleanup(setattr, h, "available_models", h.available_models)
-        h.available_models = lambda session: None
+        self.list_models(None)
         _, err = self.run_command("/model", "my-local-model")
         self.assertEqual(session.state.model, "my-local-model")
         self.assertIn("· couldn't check the model: the provider doesn't list its models", err)
-        h.available_models = lambda session: {"models/gemini-x"}  # Gemini lists ids as models/<id>
+        self.assertEqual(session.state.context_window, 262_144)
+        out, err = self.run_command("/model", "")  # nothing to pick from: the status line
+        self.assertEqual(out, "")
+        self.assertIn("· anthropic · my-local-model", err)
+        h.available_models = lambda session: {"models/gemini-x": None}  # Gemini lists ids as models/<id>
         self.run_command("/model", "gemini-x")
         self.assertEqual(session.state.model, "gemini-x")
 
@@ -688,12 +785,22 @@ class ModelAndEffort(unittest.TestCase):  # /model and /effort: switched mid-cha
         self.addCleanup(setattr, urllib.request, "urlopen", urllib.request.urlopen)
         urllib.request.urlopen = urlopen
         configure(TEH_API_KEY="k")
-        self.assertEqual(h.available_models(session), {"a", "b"})
+        self.assertEqual(h.available_models(session), {"a": None, "b": None})
         self.assertEqual(seen[0].get("X-api-key"), "k")  # the provider's own auth header
         configure(TEH_BASE_URL="https://example.test/v1")  # no list there: can't say
         self.assertIsNone(h.available_models(session))
-        pages["https://example.test/v1/models"] = {"object": "list", "data": [{"id": "m1"}, {"id": "m2"}]}
-        self.assertEqual(h.available_models(session), {"m1", "m2"})
+        # The window, under whichever name the provider gives it (OpenRouter: context_length); a non-number is none
+        pages["https://example.test/v1/models"] = {"object": "list", "data": [
+            {"id": "m1", "context_length": 128_000}, {"id": "m2", "context_window": True}, {"id": 3}, "x"]}
+        self.assertEqual(h.available_models(session), {"m1": 128_000, "m2": None})
+        # OpenRouter in the Anthropic format: Claude Code-style ids, their [1m] suffix dropped
+        pages["https://example.test/v1/models?limit=1000"] = {"data": [
+            {"id": "anthropic/deepseek/v4[1m]", "max_input_tokens": 1_048_576},
+            {"id": "anthropic/claude-haiku-5.5[1m]", "max_input_tokens": 1_000_000}]}
+        configure(TEH_BASE_URL="https://example.test/v1", TEH_FORMAT="anthropic")
+        # anthropic/ dropped only before an id of its own vendor/model form: OpenRouter's Claude ids keep theirs
+        self.assertEqual(h.available_models(session),
+                         {"deepseek/v4": 1_048_576, "anthropic/claude-haiku-5.5": 1_000_000})
 
 class Undo(unittest.TestCase):  # /undo: the last prompt and what followed it leave the conversation
     def chat(self, replies):  # a chat whose model replies with these (text, [commands]) in turn

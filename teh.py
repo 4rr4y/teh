@@ -13,7 +13,7 @@ commands:  /budget [tokens N | calls N | off]
            /compact [what to keep]
            /effort <level|off>
            /help
-           /model <id>
+           /model [id or part of one]
            /quit
            /undo
 keys:      Ctrl+C cancels the current turn   Ctrl+D exits (on Windows: Ctrl+Z, then Enter)
@@ -254,7 +254,7 @@ class Config:
     fmt: str               # API format: "anthropic" or "openai"
     thinking: int          # show reasoning, cut to this many characters (0 = hidden)
     max_tokens: int        # per reply
-    context_window: int    # no call is made once the context reaches it
+    context_window: int    # TEH_CONTEXT_WINDOW: the most State.context_window can be (/model can lower it)
     long_cache: bool       # TEH_CACHE_RETENTION=long
     output: str            # one-shot output: "text" or "json"
     auto: bool             # TEH_AUTO=1: run commands without asking, from the start (State.auto can turn on later)
@@ -315,6 +315,7 @@ class State:
     token_budget: int = 0  # tokens the whole run may use, as the status line's Σ counts them (0: no limit); /budget
     turn_budget: int = 0   # model calls for one prompt (0: no limit); /budget changes both
     turns: list = dataclasses.field(default_factory=list)  # [UndoPoint]: the prompts /undo can take back
+    context_window: int = 0  # no call is made once the context reaches it; /model fits it to the model
 
 @dataclasses.dataclass(frozen=True)
 class UndoPoint:
@@ -482,7 +483,7 @@ def effort_level(text, source):
 def start_state(cfg, environ):
     """Return the session's starting state: the settings that can change during it, as they are at startup."""
     return State(model=cfg.model, summarize=wants_summary(cfg.model, cfg.fmt, cfg.thinking), auto=cfg.auto,
-                 **read_settings(environ, "state"))
+                 context_window=cfg.context_window, **read_settings(environ, "state"))
 
 def start_session(environ):
     """Start a session from the environment variables: its settings, environment and state; exits when they're bad."""
@@ -1341,8 +1342,8 @@ EXIT_CODES = {"done": 0, "error": 1, "refused": 2, "context_full": 3, "cut_off":
 
 def full(session):
     """Whether the context window is reached: the next call would go past it."""
-    cfg, state = session.cfg, session.state
-    return state.context + state.pending >= cfg.context_window
+    state = session.state
+    return state.context + state.pending >= state.context_window
 
 def added(session, text):
     """Count text added to the conversation since the last call, in tokens (about 4 characters each)."""
@@ -1351,8 +1352,8 @@ def added(session, text):
 
 def session_status(session):
     """Return the status line's session part: totals, budgets, context, and calls for this prompt."""
-    cfg, state = session.cfg, session.state
-    total, window = state.tokens_in + state.tokens_out, cfg.context_window
+    state = session.state
+    total, window = state.tokens_in + state.tokens_out, state.context_window
     # The cached part (cheaper) and the token budget, when there are any
     about_total = " | ".join(filter(None, [state.tokens_cached and f"{state.tokens_cached:,} cached",
                                           state.token_budget and f"{state.token_budget:,} budget"]))
@@ -1379,7 +1380,7 @@ def status(session, seconds, usage: Usage, warn=True):
     inp, cached, out = usage.input, usage.cached, usage.output
     state.tokens_in, state.tokens_cached, state.tokens_out = (state.tokens_in + inp, state.tokens_cached + cached,
                                                               state.tokens_out + out)
-    before, window = state.context, cfg.context_window
+    before, window = state.context, state.context_window
     # This call's figures include what was pending
     state.context, state.pending = inp + out, 0
     cache = f" ({cached:,} cached)" if cached else ""
@@ -1467,7 +1468,7 @@ def turn(session, user):
             if full(session):
                 if just_compacted:
                     dim("· the context window is still full right after compacting: stopping. TEH_CONTEXT_WINDOW "
-                        f"({cfg.context_window:,}) may be too small for this model")
+                        f"({state.context_window:,}) may be too small for this model")
                     return "context_full"
                 if not compact(session):
                     rollback(session, mark)
@@ -1620,7 +1621,6 @@ def read_prompt():
 
 def piped_input(session):
     """Read stdin, for the prompt: tidied like command output, any bytes accepted (a log may have stray ones)."""
-    cfg = session.cfg
     # As bytes: on Windows the console's code page isn't what was piped
     data = sys.stdin.buffer.read(OUTPUT_MAX_BYTES)
     # Anything after the limit means the input was cut off
@@ -1628,7 +1628,7 @@ def piped_input(session):
     text = decode(data, cut=bool(more))
     # Meant to be read whole, so cut only if it would take more than half the context window (about 4 characters a
     # token): the first and last parts, with the whole of it saved for grep
-    text = clip(session, tidy(text), limit=cfg.context_window * 2)
+    text = clip(session, tidy(text), limit=session.state.context_window * 2)
     return text + (f"\n[… input cut off at {OUTPUT_MAX_BYTES:,} bytes]" if more else "")
 
 # ===== Main: one-shot (task given or piped) or chat =================================================================
@@ -1702,7 +1702,7 @@ def startup_segment(session):
   agents   {env.agents_info}
   api      {cfg.base} ({cfg.fmt} format)
   cache    {cache_info(session)}
-  model    {state.model} · effort {state.effort or 'default'} · context window {cfg.context_window:,} · max reply \
+  model    {state.model} · effort {state.effort or 'default'} · context window {state.context_window:,} · max reply \
 {cfg.max_tokens:,}
   role     {cfg.role}
   commands {'run without asking (TEH_AUTO=1)' if state.auto else 'ask before running'}
@@ -1729,44 +1729,142 @@ def chat_effort(session, arg):
             return
     show_status(session)
 
+# Where a model list entry gives the model's context window, first match wins: Anthropic, OpenRouter and Together,
+# Groq, Mistral. Not standard: a provider that uses none of these (OpenAI) shows "?", and the window stays as it is
+WINDOW_FIELDS = ("max_input_tokens", "context_length", "context_window", "max_context_length")
+# Models the /model picker lists at most; a longer list is narrowed with part of the id
+PICKER_MAX = 40
+
+def model_window(entry):
+    """Return the context window a model list entry gives, in tokens, or None if it gives none."""
+    for field in WINDOW_FIELDS:
+        value = entry.get(field)
+        # Not a bool, which is an int too
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
 def available_models(session):
-    """Return the model ids the provider lists, or None when it can't say (no list, an error)."""
+    """Return {model id: its context window, or None} for the models the provider lists, or None when it can't say
+    (no list, an error)."""
     cfg = session.cfg
-    url, ids = cfg.base + "/models" + cfg.api.models_query, set()
+    url, models = cfg.base + "/models" + cfg.api.models_query, {}
     headers = {k: v for k, v in cfg.headers.items() if k != "content-type"}
     try:
         while url:
             with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=15) as resp:
                 page = json.load(resp)
-            ids |= {m["id"] for m in page.get("data") or [] if isinstance(m, dict) and m.get("id")}
+            models |= {plain_id(m["id"]): model_window(m) for m in page.get("data") or []
+                       if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]}
             # Anthropic pages its list: the next page starts after the last id
             more = page.get("has_more") and page.get("last_id")
             url = more and f"{cfg.base}/models?limit=1000&after_id={urllib.parse.quote(more)}"
     except (OSError, ValueError, AttributeError):
         # OSError covers HTTP and network errors; ValueError, bad JSON; AttributeError, JSON that isn't an object
         return None
-    return ids or None
+    return models or None
+
+def plain_id(listed_id):
+    """Return a listed model id as the provider takes it in a request.
+
+    OpenRouter, asked in the Anthropic format, lists Claude Code-style ids: anthropic/<id>[1m]. The [1m] only marks a
+    window of 1M tokens or more, and anthropic/ comes before every id, its own Claude ids (anthropic/claude-...)
+    included: it's dropped where an id of the usual vendor/model form follows (anthropic/deepseek/deepseek-v4.1).
+    """
+    return re.sub(r"^anthropic/(?=[^/]+/)", "", re.sub(r"\[[^\]]*\]$", "", listed_id))
+
+def listed_name(model, listed):
+    """Return the id model is listed under, also as <prefix>/<id> (Gemini's models/<id>), or None when it isn't
+    listed."""
+    if model in listed:
+        return model
+    return next((name for name in sorted(listed) if name.endswith("/" + model)), None)
+
+def pick_model(session, query, listed):
+    """Show the listed models whose ids contain query (all of them for none; the closest when none does), numbered
+    with their context windows, and return the one the user picks, or None."""
+    cfg = session.cfg
+    matches = sorted(name for name in listed if query.lower() in name.lower())
+    count = f"{len(listed):,} model{'s' * (len(listed) != 1)} {cfg.base} lists"
+    if matches:
+        print(f"{len(matches):,} of the {count}" + (f" contain {query!r}" if query else "") + ":")
+    elif close := difflib.get_close_matches(query, listed, n=5):
+        print(f"none of the {count} contains {query!r}; the closest:")
+        matches = close
+    else:
+        print(f"none of the {count} contains {query!r}, or is close to it")
+        return None
+    shown = matches[:PICKER_MAX]
+    width = max(len(name) for name in shown)
+    for n, name in enumerate(shown, 1):
+        window = listed[name]
+        print(f"{n:>4}. {safe(name).ljust(width)}  {f'{window:,}' if window else '?':>9} context")
+    if len(matches) > len(shown):
+        print(f"   … {len(matches) - len(shown):,} more: narrow the list with /model <part of the id>")
+    try:
+        answer = input("pick a number (Enter to cancel): ").strip()
+    # Ctrl+D or Ctrl+C: cancelled, like Enter
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not answer:
+        return None
+    if not (answer.isdigit() and 1 <= int(answer) <= len(shown)):
+        print(f"not a number from 1 to {len(shown)}: nothing changed")
+        return None
+    return shown[int(answer) - 1]
+
+def window_for(session, window):
+    """Return (the context window for a model whose own is window, why): None (unknown) gives TEH_CONTEXT_WINDOW.
+
+    The model's own, less room for a reply (TEH_MAX_TOKENS), as a call must fit the conversation and the reply; at
+    least half the model's own. It replaces TEH_CONTEXT_WINDOW, larger or smaller.
+    """
+    cfg = session.cfg
+    if window is None:
+        return cfg.context_window, "TEH_CONTEXT_WINDOW: the provider gives none for it"
+    room = max(window - cfg.max_tokens, window // 2)
+    return room, f"the model's {window:,}, less {window - room:,} for a reply"
 
 def chat_model(session, arg):
-    """/model <id>: another model from the next call on; on its own, only the status line."""
-    cfg, state, msgs = session.cfg, session.state, session.msgs
-    model = arg.strip()
-    if model and model != state.model:
-        listed = available_models(session)
-        # Known when listed, also as <prefix>/<id> (Gemini lists its ids as models/<id>)
-        if listed is not None and model not in listed and not any(i.endswith("/" + model) for i in listed):
-            close = difflib.get_close_matches(model, listed, n=3)
-            listing = f"{len(listed):,} model{'s' * (len(listed) != 1)} {cfg.base} lists"
-            print(f"unknown model {model!r}: it isn't among the {listing}"
-                  + (f"; did you mean {' or '.join(close)}?" if close else ""))
+    """/model [id or part of one]: another model from the next call on, with its context window.
+
+    An id the provider lists switches at once; part of one, or nothing, lists the models that match to pick from.
+    Without a list from the provider, an id switches unchecked, and nothing shows the status line. A model whose
+    window the conversation doesn't fit is refused: compacting it would need the new model to read it all.
+    """
+    state, msgs = session.state, session.msgs
+    query = arg.strip()
+    listed = available_models(session)
+    if listed is None:
+        if not query or query == state.model:
+            show_status(session)
             return
-        state.model, state.summarize = model, wants_summary(model, cfg.fmt, cfg.thinking)
+        model, window = query, None
+    # Listed: the name as typed (the provider accepts it), with the window its listing gives
+    elif query and (name := listed_name(query, listed)):
+        model, window = query, listed[name]
+    elif picked := pick_model(session, query, listed):
+        model, window = picked, listed[picked]
+    else:
+        return
+    new, why = window_for(session, window)
+    used = state.context + state.pending
+    if msgs and used >= new:
+        print(f"not switched: the conversation ({used:,} tokens) doesn't fit {safe(model)}'s context window ({new:,}, "
+              f"{why}). /compact it first, with the current model, or /clear to start fresh")
+        return
+    if model != state.model:
+        state.model, state.summarize = model, wants_summary(model, session.cfg.fmt, session.cfg.thinking)
         if listed is None:
             dim("· couldn't check the model: the provider doesn't list its models, so an unknown one fails at the "
                 "next call")
         # Each model has its own prompt cache
         if msgs:
             dim("· the prompt cache is per model: the next call reads the conversation at full price")
+    if new != state.context_window:
+        dim(f"· context window {state.context_window:,} → {new:,} ({why})")
+        state.context_window = new
     show_status(session)
 
 def chat_budget(session, arg):

@@ -277,7 +277,7 @@ function teh-local { $input | teh-with @{ TEH_BASE_URL = "ollama"; TEH_MODEL = "
 | `TEH_EFFORT` | provider default | Reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` (which work depends on the model; anything else is refused at startup); `/effort` changes it in chat |
 | `TEH_AUTO` | off | `1` runs commands without asking |
 | `TEH_MAX_TOKENS` | `16000` | Max output tokens per reply |
-| `TEH_CONTEXT_WINDOW` | `262144` | Context size at which `teh` compacts the conversation (see [Compaction](DESIGN.md#compaction)). Keep it a little below the model's real limit; local models often need a smaller one, e.g. `32000` |
+| `TEH_CONTEXT_WINDOW` | `262144` | Context size at which `teh` compacts the conversation (see [Compaction](DESIGN.md#compaction)). Keep it a little below the model's real limit; local models often need a smaller one, e.g. `32000`. After `/model`, the window is the new model's own, less `TEH_MAX_TOKENS` for the reply, when the provider's list gives it, and this otherwise |
 | `TEH_THINKING` | `0` (hidden) | Show the model's reasoning, cut to this many characters |
 | `TEH_FORMAT` | from the URL | `anthropic` or `openai` API format |
 | `TEH_OUTPUT` | text | `json` prints one-shot results as one JSON object |
@@ -320,7 +320,7 @@ The startup segment shows what `teh` found: OS, shell, working directory, the se
 
 | Command | What it does |
 |---|---|
-| `/model <id>` | Switch to another model of the same provider, from the next call on |
+| `/model [id or part of one]` | Switch to another model of the same provider, from the next call on. Part of an id, or nothing, lists the provider's models that match, with their context windows, to pick one by number |
 | `/effort <level\|off>` | Change the reasoning effort |
 | `/budget [tokens N \| calls N \| off]` | Change the budgets: `N` is a whole number, `0` for no limit (see [Budgets](#budgets)) |
 | `/compact [what to keep]` | Replace the conversation with a summary (see [Compaction](DESIGN.md#compaction)) |
@@ -329,7 +329,7 @@ The startup segment shows what `teh` found: OS, shell, working directory, the se
 | `/help` | Show all options |
 | `/quit` | Exit |
 
-Commands that change something answer with the status line as it now stands; on their own, `/model`, `/effort` and `/budget` just show it.
+Commands that change something answer with the status line as it now stands; on their own, `/effort` and `/budget` just show it (and `/model` too, when the provider doesn't list its models).
 
 ## Budgets
 
