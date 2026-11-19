@@ -266,7 +266,7 @@ Every call resends the whole conversation, so long sessions get expensive. Compa
 
 Both budgets are checked before each model call, including a compaction call: the token budget adds what has been used to what the next call would resend (the conversation so far, and what was added since), so the run stops before the call that would go over, not after it. It's a token budget, not a cost budget: cached tokens cost about a tenth as much, but count in full, so a long chat reaches it sooner than its cost would suggest.
 
-When a budget stops a turn, the commands that finished are kept in the conversation, so `continue` picks up where the model stopped rather than repeating the prompt, which would redo the work.
+In chat, `/budget` changes either budget: `/budget tokens 2000000`, `/budget calls 50`, `/budget calls 0` (no limit), or `/budget off` for both. When a budget stops a turn, the commands that finished are kept in the conversation, so `continue` picks up where the model stopped rather than repeating the prompt, which would redo the work.
 
 ## Chat internals
 
@@ -275,6 +275,173 @@ When a budget stops a turn, the commands that finished are kept in the conversat
 - **`/model`** checks the name against the models the provider lists (`GET /models`). A listed id switches at once; part of one, or nothing, lists the models whose ids contain it (or, for a typo, the closest), numbered with their context windows, to pick one by number. If the provider doesn't list its models, the switch goes ahead and an unknown name fails at the next call, with the provider's own error.
 - **The context window follows the model:** after a switch it is the model's own window less `TEH_MAX_TOKENS` (a call must fit the conversation and the reply), larger or smaller than `TEH_CONTEXT_WINDOW`, which applies only when the provider doesn't give the model's window; `teh` says when it changes. A switch to a model whose window the conversation doesn't fit is refused, with a pointer to `/compact` (with the current model) or `/clear`: compacting after the switch would need the new model to read the whole conversation, which is what doesn't fit. There's no standard field for the window: the list's `max_input_tokens` (Anthropic), `context_length` (OpenRouter, Together), `context_window` (Groq) or `max_context_length` (Mistral), else it's unknown (OpenAI) and `TEH_CONTEXT_WINDOW` applies. OpenRouter, asked in the Anthropic format, lists Claude Code-style ids (`anthropic/<id>[1m]`): the `[1m]` only marks a window of 1M tokens or more, so it's dropped, and so is `anthropic/` where an id of the usual `vendor/model` form follows it (OpenRouter's own Claude ids, `anthropic/claude-…`, keep it). Models don't share a prompt cache, so after a switch the next call reads the whole conversation at full price: `teh` says so when there is a conversation to re-read. The API format (`TEH_FORMAT`) can't change mid-chat.
 - **Pastes:** terminals that mark pastes are handled by readline, and for others `teh` joins lines that arrive at the same moment (on Windows, `msvcrt.kbhit`).
+
+## Settings checks
+
+At startup, `teh` warns about any `TEH_` variable it doesn't know, e.g. `unknown setting TEH_MODLE: did you mean TEH_MODEL?`, and stops with a clear message if a setting has a value it can't use: a number setting that isn't a whole number, an effort level it doesn't know, or a setting with fixed values (`TEH_AUTO`, `TEH_AGENTS_MD`, `TEH_FORMAT`, `TEH_OUTPUT`, `TEH_CACHE_RETENTION`) set to something else, e.g. `TEH_AUTO=true`. Those values may be in any case.
+
+The chat's startup segment shows what `teh` found: OS, shell, working directory, the session's scratch folder, `AGENTS.md`, API, caching and model settings, the model's role, and any budgets.
+
+## The status line
+
+```
+· anthropic · claude-opus-5-5 · medium · 12.4s · in 48,210 (45,900 cached) · out 1,204 · Σ 312,877 (241,350 cached) · ctx 49,414/262,144 (19%)
+```
+
+| Field | Meaning |
+|---|---|
+| `anthropic` | The provider: its shortcut name (also for a URL on the same server), else the URL's host (non-ASCII names in their `xn--` form, so lookalike letters stand out); `custom` for a server on this machine or a private network that isn't a known one, e.g. a llama.cpp server on `localhost:8080` |
+| `claude-opus-5-5` · `medium` | The model that answered, and the effort (`default`: the provider's own) |
+| `12.4s` | How long the reply took, including retries |
+| `in` (`cached`) | Input tokens for this call: the whole conversation, resent every call. The cached part costs about a tenth as much |
+| `out` | Output tokens for this reply |
+| `Σ` (`cached`, `budget`) | Session totals, how much of them came from the cache, and `TEH_TOKEN_BUDGET` when one is set |
+| `ctx` | Context used, out of the context window. When it passes half, `teh` suggests `/compact` once (it never compacts by itself before the window is full); it warns after every call from 80%, and compacts the conversation at 100% |
+| `calls` | Model calls for this prompt out of `TEH_TURN_BUDGET`, e.g. `3/40 calls`, shown only when one is set |
+
+Commands that change something (`/model`, `/effort`, `/budget`, `/undo`, `/clear`) answer with the status line as it now stands; on their own, `/effort` and `/budget` just show it (and `/model` too, when the provider doesn't list its models). While waiting, a live `· thinking… 7s` timer is shown, in a terminal only.
+
+## One-shot results
+
+With a task (or piped input), `teh` runs once and exits. The answer, the model's last reply, goes to stdout at the end; its earlier replies, status lines and commands go to stderr, so pipes get only the answer. Piped input is added to the task, cleaned of terminal codes; very long input is cut to fit, with the whole of it saved for the model to `grep`. Without a terminal there's nobody to approve commands, so unless `TEH_AUTO=1` is set the run stops with `no terminal to approve commands: set TEH_AUTO=1` (exit code 1).
+
+| Exit code | `ended` (JSON) | Meaning |
+|---|---|---|
+| 0 | `done` | Done |
+| 1 | `error` | Error: the API returned an error, or the network failed |
+| 2 | `refused` | The model or provider refused |
+| 3 | `context_full` | The context window was full, and compacting didn't help (or failed) |
+| 4 | `cut_off` | The reply was cut off at `TEH_MAX_TOKENS` |
+| 5 | `budget` | `TEH_TOKEN_BUDGET` or `TEH_TURN_BUDGET` was reached (`error` says which) |
+| 130 | `cancelled` | Cancelled with Ctrl+C |
+
+With `TEH_OUTPUT=json`, stdout gets one object instead of the answer text:
+
+```json
+{"ended": "done", "answer": "There are 12 Python files.", "error": null, "model": "claude-opus-5-5",
+ "tokens": {"input": 2103, "cached": 640, "output": 95, "context": 1550},
+ "commands": [{"command": "find . -name '*.py' | wc -l", "exit": 0}], "compactions": 0}
+```
+
+Each command has its exit code; a command that was stopped (it timed out, or its output passed 5,000,000 bytes) has `"exit": null`, and a declined one has `"declined"` with the message the model was given. `error` says why a run that didn't finish ended.
+
+More examples, in sh:
+
+```sh
+if TEH_AUTO=1 teh "check that the docs build without warnings" > report.txt; then
+    echo "ok"
+else
+    echo "teh ended with exit code $?"
+fi
+TEH_OUTPUT=json TEH_AUTO=1 teh "update the changelog" | jq '.tokens, .commands'
+for f in src/*.py; do                             # one run per file
+    teh "suggest one improvement to this file" < "$f" > "reviews/$(basename "$f").md"
+done
+# crontab -e: every morning, a summary of yesterday's commits
+0 8 * * * cd ~/project && TEH_AUTO=1 teh "summarise yesterday's commits for the team" > ~/summary.txt
+```
+
+## Windows
+
+`teh` runs in cmd, Windows PowerShell and PowerShell 7. On Windows, `py teh.py` works too where the Python launcher is installed.
+
+**A `teh` command.** cmd: a `teh.cmd` in a folder on `PATH`, here `%USERPROFILE%\bin` (run in the teh folder):
+
+```bat
+mkdir "%USERPROFILE%\bin" 2>nul & echo @python "%CD%\teh.py" %*> "%USERPROFILE%\bin\teh.cmd"
+```
+
+PowerShell: a function in your profile, loaded by every new PowerShell window (run in the teh folder):
+
+```powershell
+New-Item -ItemType Directory -Force (Split-Path $PROFILE) | Out-Null
+Add-Content $PROFILE '$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false'
+$line = 'function teh { $in = @($input); if ($in.Count) { $in | python "TEH" $args } else { python "TEH" $args } }'
+Add-Content $PROFILE $line.Replace("TEH", "$PWD\teh.py")
+```
+
+The function passes on what's piped to it (`git diff | teh "review this"`) only when there is something, so `teh` on its own still chats in the console. The first line makes text piped to and from programs UTF-8, so non-English text survives `git diff | teh` and `teh … | Set-Content` (Windows PowerShell's defaults are ASCII and the console's old code page; PowerShell 7's still the latter). It works in every version, 1.0 to 7. Windows PowerShell doesn't load profiles until scripts are allowed for your user: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. Without the profile, run these lines in each new window instead.
+
+**Scripts and pipelines,** cmd. Settings are set for the rest of the session, as cmd has no way to set one for a single command:
+
+```bat
+git diff | teh "review this change"
+git diff --staged | teh "write a commit message" > msg.txt
+type error.log | teh "explain this error" | more
+teh "summarise this file in 3 lines" < notes.txt
+set "TEH_AUTO=1" & teh "run the tests and fix any failures" & set "TEH_AUTO="
+call teh "check that the docs build without warnings" > report.txt
+if errorlevel 1 (echo teh ended with exit code %errorlevel%) else (echo ok)
+rem one run per file (in a .cmd file, write %%f instead of %f)
+for %f in (src\*.py) do @teh "suggest one improvement to this file" < "%f" > "reviews\%~nf.md"
+```
+
+PowerShell, with the `teh` function and its UTF-8 line (these work in Windows PowerShell 5.1 and PowerShell 7; avoid `"` inside a prompt, which Windows PowerShell drops from a program's arguments, a bug fixed in PowerShell 7.3):
+
+```powershell
+git diff | teh "review this change"
+git diff --staged | teh "write a commit message" | Set-Content msg.txt    # > writes UTF-16 in Windows PowerShell
+Get-Content -Encoding UTF8 error.log | teh "explain this error" | more
+Get-Content -Encoding UTF8 notes.txt | teh "summarise this file in 3 lines"   # PowerShell has no < for input
+$env:TEH_AUTO = "1"; teh "run the tests and fix any failures"; Remove-Item env:TEH_AUTO
+teh "check that the docs build without warnings" | Set-Content report.txt
+if ($LASTEXITCODE -eq 0) { "ok" } else { "teh ended with exit code $LASTEXITCODE" }
+$env:TEH_OUTPUT = "json"
+(teh "how many Python files are here?" | ConvertFrom-Json).answer     # ConvertFrom-Json: PowerShell 3.0 and later
+$env:TEH_OUTPUT = $null
+```
+
+Windows PowerShell's `Get-Content` reads a file without a byte-order mark in the ANSI code page, so `-Encoding UTF8` keeps UTF-8 files' non-English text whole (PowerShell 7 reads UTF-8 by default). Its `Set-Content` writes the ANSI code page; add `-Encoding UTF8` for UTF-8 there too.
+
+**Several setups.** cmd: a `.cmd` file per setup, in a folder on `PATH`; `setlocal` keeps its settings from leaking into your session:
+
+```bat
+@echo off
+rem teh-cheap.cmd
+setlocal
+set "TEH_BASE_URL=opencode-go"
+set "TEH_MODEL=deepseek-v4.1-flash"
+set /p TEH_API_KEY=< "%USERPROFILE%\.keys\opencode"
+call teh %*
+```
+
+PowerShell: functions in your profile (`notepad $PROFILE`). Each sets its settings for the run, then puts back what was there:
+
+```powershell
+function teh-with($settings, $arguments) {
+    $saved = @{}
+    foreach ($name in $settings.Keys) { $saved[$name] = [Environment]::GetEnvironmentVariable($name); [Environment]::SetEnvironmentVariable($name, $settings[$name]) }
+    $input | teh @arguments
+    foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
+}
+function teh-cheap { $input | teh-with @{ TEH_BASE_URL = "opencode-go"; TEH_MODEL = "deepseek-v4.1-flash"; TEH_API_KEY = (Get-Content "$HOME\.keys\opencode") } $args }
+function teh-local { $input | teh-with @{ TEH_BASE_URL = "ollama"; TEH_MODEL = "qwen3"; TEH_CONTEXT_WINDOW = "32000" } $args }
+```
+
+**A scheduled run:** put the run in a `.cmd` file, with its settings, and schedule that (from cmd or PowerShell):
+
+```bat
+@echo off
+rem C:\project\summary.cmd
+cd /d C:\project
+set "TEH_BASE_URL=opencode-go"
+set "TEH_MODEL=deepseek-v4.1-flash"
+set "TEH_API_KEY=<your key>"
+set "TEH_AUTO=1"
+call teh "summarise yesterday's commits for the team" > "%USERPROFILE%\summary.txt"
+```
+
+```bat
+schtasks /create /tn teh-summary /sc daily /st 08:00 /tr C:\project\summary.cmd
+```
+
+## Safety details
+
+- **The approval prompt is the main safeguard.** With `TEH_AUTO=1` (or `a`), commands run unseen, and since the model reads web pages, a page could try to steer it. The web helper can send data (`-d`, `--json`, any `-X` method) as well as read pages, so check what a `teh-fetch` command sends, and where, before approving it.
+- **Text from the web:** the helper leaves out hidden elements (`hidden`, `aria-hidden`, `display:none`, `visibility:hidden`); text hidden by a page's stylesheets can't be detected this way. It labels its output as data, and the model is told never to follow instructions found in it.
+- **Hidden characters:** control characters and invisible or direction-changing Unicode are removed from web text. They're also shown as a visible `�` in the model's answers, its reasoning and the commands you approve, so a command can't look different from what it is.
+- **`AGENTS.md`** is read from the project root down to the working directory, never from above the project root or your home folder (see [AGENTS.md](#agentsmd)). It's loaded whenever present, so use `TEH_AGENTS_MD=0` in projects you don't trust, and keep your own short: it's sent with every call.
+- **The model's commands don't see `teh`'s settings.** Every `TEH_` variable, `TEH_API_KEY` included, is removed from their environment. The one they get is `TEH_SCRATCH`, the scratch folder's path, which `teh` sets itself for the web helper. The rest of your environment is passed on unchanged, so a key you've exported under another name (e.g. `ANTHROPIC_API_KEY`) is still visible to them.
 
 ## How the code is organised
 
@@ -315,3 +482,26 @@ The tests use fake API servers on your machine (`tests/fakes/`): no API key, no 
 The suites wait for each fake server to accept connections, and for each prompt in chat tests, rather than for fixed times; the waits that remain are the deliberate ones (command timeouts, `retry-after`, a slow server).
 
 To measure what a change does with a real model, in tokens and in results, use the benchmark in `bench/` (see [`bench/README.md`](bench/README.md)).
+
+### Running them
+
+They need only Python, and run the same way on Linux, macOS and Windows (use `python3` where `python` is Python 2, and `\` in paths on Windows):
+
+```sh
+python tests/e2e/run.py              # every suite (about a minute)
+python tests/e2e/run.py core fetch   # some of them
+python tests/e2e/run.py --changed    # only the suites affected by what changed since they last passed
+cd tests && python -m unittest test_units   # the unit tests alone
+```
+
+### Linting (for development only)
+
+You don't need ruff, or anything in `requirements-dev.txt`, to use `teh`: it still needs nothing but Python. The code is checked with [ruff](https://docs.astral.sh/ruff/), with the rules in `ruff.toml`: the same check locally and in CI, at the version pinned in `requirements-dev.txt`.
+
+```sh
+pip install -r requirements-dev.txt   # once: development tools only, not needed to use teh
+ruff check                            # lint, from the repository's root
+git config core.hooksPath .githooks   # once per clone: lint and unit tests before every push
+```
+
+With the hook on, a push that would fail the lint check or the unit tests stops before it leaves (`git push --no-verify` pushes anyway).
