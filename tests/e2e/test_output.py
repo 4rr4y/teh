@@ -30,6 +30,10 @@ s.check("error (HTTP 400) -> 1", oneshot(TEH_BASE_URL="http://127.0.0.1:8782/400
 s.check("refused -> 2", oneshot(TEH_BASE_URL="http://127.0.0.1:8774", TEH_MODEL="m").code == 2)
 s.check("context window full -> 3", oneshot(TEH_BASE_URL="http://127.0.0.1:8765", TEH_MODEL="m", TEH_AUTO=1,
                                             TEH_CONTEXT_WINDOW=1000).code == 3)
+r = oneshot(TEH_BASE_URL="http://127.0.0.1:8765", TEH_MODEL="m", TEH_AUTO=1, TEH_CONTEXT_WINDOW=1000, TEH_OUTPUT="json")
+d = json.loads(r.out) if r.out.strip().startswith("{") else {}
+s.check("context window full: the JSON says why", d.get("ended") == "context_full"
+        and "still full right after compacting" in (d.get("error") or ""))
 s.check("reply cut off -> 4", oneshot(TEH_BASE_URL="http://127.0.0.1:8782/cut", TEH_MODEL="m").code == 4)
 s.check("no budget by default: a run of 3 model calls finishes",
         oneshot(TEH_BASE_URL="http://127.0.0.1:8771", TEH_MODEL="m", TEH_AUTO=1).code == 0)
@@ -57,6 +61,11 @@ s.check("no terminal and no TEH_AUTO: a clear error, exit 1", r.code == 1
 r = s.teh("go", detached=True, env={"TEH_BASE_URL": "http://127.0.0.1:8771", "TEH_MODEL": "m",
                                     "TEH_SHELL": DEFAULT_SHELL, "TEH_AUTO": 1})
 s.check("no terminal, with TEH_AUTO=1: the commands run, exit 0", r.code == 0 and "\n$ exit 7\n" in r.err)
+
+r = s.teh("explain", "ls", "-h", env={"TEH_SHELL": DEFAULT_SHELL, "TEH_BASE_URL": "http://127.0.0.1:8766",
+                                     "TEH_MODEL": "m"})
+s.check("-h within a task is part of the task, not --help", r.code == 0 and "usage:" not in r.both)
+s.check("-h first is --help", "usage:" in s.teh("-h").both)
 
 section("TEH_OUTPUT=json")
 r = oneshot(TEH_BASE_URL="http://127.0.0.1:8771", TEH_MODEL="m", TEH_AUTO=1, TEH_OUTPUT="json")

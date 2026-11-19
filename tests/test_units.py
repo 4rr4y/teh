@@ -372,6 +372,24 @@ class Harness(unittest.TestCase):
             self.assertEqual(h.step(session, msgs).text, "")
             self.assertEqual(msgs, [{"role": "user", "content": "hi"}])
 
+    def test_a_cut_off_replys_arguments_are_kept_as_empty_json(self):  # cut-off JSON: a strict server rejects it
+        reply = {"choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": None,
+                 "tool_calls": [{"id": "c1", "type": "function",
+                                 "function": {"name": "shell", "arguments": '{"command": "ec'}}]}}], "usage": {}}
+        self.addCleanup(setattr, h, "post", h.post)
+        configure(TEH_BASE_URL="openai")
+        h.post = lambda session, path, body: reply
+        msgs = [{"role": "user", "content": "hi"}]
+        result = h.step(session, msgs)
+        self.assertEqual((result.calls, result.usage.cut_off), ([("c1", {})], True))
+        self.assertEqual(msgs[1]["tool_calls"][0]["function"], {"name": "shell", "arguments": "{}"})
+        self.assertEqual(reply["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], '{"command": "ec')
+        reply["choices"][0]["finish_reason"] = "tool_calls"  # not cut off: kept as sent
+        reply["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = '{"command": "ls"}'
+        msgs = [{"role": "user", "content": "hi"}]
+        h.step(session, msgs)
+        self.assertEqual(msgs[1]["tool_calls"][0]["function"]["arguments"], '{"command": "ls"}')
+
     def test_piped_input(self):
         import io
         import tempfile
@@ -984,6 +1002,17 @@ class EditHelper(unittest.TestCase):  # teh.py --edit FILE < BLOCKS (teh-edit)
         self.assertEqual(code, 1)
         self.assertIn("doesn't exist (to create it, give one block with an empty SEARCH)", out)
 
+    def test_an_empty_search_for_a_file_that_exists_says_so(self):  # also when its new text has ======= lines
+        path = self.file("Title\n=======\n\nIntro\n")
+        code, out = self.edit(path, raw="<<<<<<< SEARCH\n=======\nTitle\n=======\n\nNew intro\n>>>>>>> REPLACE\n")
+        self.assertEqual(code, 1)
+        self.assertIn(f"block 1: SEARCH is empty, which only creates a new file; {path} exists", out)
+        self.assertEqual(path.read_text(), "Title\n=======\n\nIntro\n")
+        # A SEARCH that starts with a ======= line (a heading's underline) still edits
+        code, out = self.edit(path, raw="<<<<<<< SEARCH\n=======\n\nIntro\n=======\n=======\n\nIntro, edited\n"
+                                        ">>>>>>> REPLACE\n")
+        self.assertEqual((code, path.read_text()), (0, "Title\n=======\n\nIntro, edited\n"), out)
+
     def test_refusals(self):
         path = self.file("x\n")
         self.assertIn("not edited: no blocks", self.edit(path, raw="just text")[1])
@@ -1015,6 +1044,11 @@ class Failures(unittest.TestCase):  # expected failures end a turn with their me
         self.assertIn("an unexpected reply from the provider (KeyError: 'content')", session.state.turn.error)
         self.assertNotIn("Traceback", err)
         self.assertEqual(session.msgs, [])  # rolled back: nothing finished
+
+    def test_a_full_context_says_why(self):  # in TEH_OUTPUT=json's error, as every other failure does
+        ended, _ = self.run_turn(full=lambda session: True, compact=lambda session, focus="": False)
+        self.assertEqual(ended, "context_full")
+        self.assertEqual(session.state.turn.error, "the context window is full, and compacting the conversation failed")
 
     def test_a_reply_that_isnt_json(self):
         configure()

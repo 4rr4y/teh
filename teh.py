@@ -1006,9 +1006,14 @@ class OpenAIFormat(APIFormat):
         if m.get("refusal") or choice.get("finish_reason") == "content_filter":
             raise Refused(m.get("refusal") or "blocked by the provider's content filter")
         # An empty reply is left out of the history (as above), else it's kept verbatim: DeepSeek and Gemini need
-        # their extra fields
+        # their extra fields. A cut-off reply's arguments may be cut-off JSON, which a strict server rejects when
+        # it's sent back: they're kept as {} (its commands don't run, see turn)
         if m.get("content") or m.get("tool_calls"):
-            msgs.append({k: v for k, v in m.items() if v is not None})
+            kept = {k: v for k, v in m.items() if v is not None}
+            if cut and kept.get("tool_calls"):
+                kept["tool_calls"] = [{**c, "function": {**c["function"], "arguments": "{}"}}
+                                      for c in kept["tool_calls"]]
+            msgs.append(kept)
         u = r.get("usage") or {}
         # Reasoning is reasoning_content at DeepSeek, reasoning at most others. A cut-off reply's arguments may be
         # incomplete JSON: they aren't parsed, as its commands won't run (see turn)
@@ -1467,10 +1472,12 @@ def turn(session, user):
             # The window is full: replace the conversation with a summary, then carry on from it
             if full(session):
                 if just_compacted:
-                    dim("· the context window is still full right after compacting: stopping. TEH_CONTEXT_WINDOW "
-                        f"({state.context_window:,}) may be too small for this model")
+                    hint = f"TEH_CONTEXT_WINDOW ({state.context_window:,}) may be too small for this model"
+                    state.turn.error = f"the context window is still full right after compacting. {hint}"
+                    dim(f"· the context window is still full right after compacting: stopping. {hint}")
                     return "context_full"
                 if not compact(session):
+                    state.turn.error = "the context window is full, and compacting the conversation failed"
                     rollback(session, mark)
                     return "context_full"
                 # The summary includes this turn so far; an error now mustn't remove it
@@ -1634,7 +1641,8 @@ def piped_input(session):
 # ===== Main: one-shot (task given or piped) or chat =================================================================
 def main():
     """Run teh: once, for a task given as arguments or piped in, else as a chat; return the exit code."""
-    if {"-h", "--help"} & set(sys.argv[1:]):
+    # Only as the first argument: a task may contain -h (teh explain ls -h)
+    if sys.argv[1:2] in (["-h"], ["--help"]):
         raise SystemExit(USAGE)
     check_names(os.environ)
     session = start_session(os.environ)
@@ -2772,7 +2780,10 @@ def edit_main(args):
             if whitespace_only:
                 loose.append(line)
         except LookupError as e:
-            problems.append(f"block {n}: {e}".replace("\r", ""))
+            # Read with an empty SEARCH, the block would create the file: say that, as for a block with one reading,
+            # rather than what the other readings (with a ======= line of the new text ending SEARCH) didn't find
+            why = f"SEARCH is empty, which only creates a new file; {path} exists" if not readings[0][0] else e
+            problems.append(f"block {n}: {why}".replace("\r", ""))
     if applied:
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(text)
