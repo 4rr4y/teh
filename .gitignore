@@ -1,0 +1,12 @@
+# Secrets: never commit an API key
+key.txt
+*.key
+.env
+
+# Local output: benchmark runs (logs, traces, answers) and test bookkeeping
+bench/results/
+tests/unix/.passed
+
+# Python
+__pycache__/
+*.pyc

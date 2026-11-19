@@ -1,0 +1,36 @@
+== fizzbuzz.ml
+1
+2
+Fizz
+4
+Buzz
+Fizz
+7
+8
+Fizz
+Buzz
+11
+Fizz
+13
+14
+FizzBuzz
+== primes.ml
+2 3 5 7 11 13 17 19 23 29 31 37 41 43 47
+count: 15
+== bank.ml
+120
+refused: Bob has only 20
+Ada: 120 ["+50", "-30"]
+Bob: 25 ["+5"]
+== strings.ml
+ada	91
+grace	88
+mean: 89.5
+quote: "done" ["a\"b", 1.5, nil, true]
+== math.ml
+512 -4 4
+3.5 2 1 2
+3 9 14
+true false true true
+default zero is true
+[0, 1, 4, 9, 16] 16 -1 4.5
