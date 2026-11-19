@@ -23,7 +23,7 @@ class H(http.server.BaseHTTPRequestHandler):
         elif str(first["content"]).startswith("[This conversation was compacted"):
             path = re.search(r"saved at (\S+?): grep", first["content"]).group(1)
             with open(LOG, "a") as f:
-                f.write(json.dumps({"transcript": open(path).read()}) + "\n")
+                f.write(json.dumps({"transcript": open(path, encoding="utf-8").read()}) + "\n")
             msg = {"role": "assistant", "content": "continued after compaction"}
         elif not any(m["role"] == "tool" for m in msgs):
             msg = {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function",

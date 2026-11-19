@@ -6,6 +6,7 @@ key.txt
 # Local output: benchmark runs (logs, traces, answers) and test bookkeeping
 bench/results/
 tests/unix/.passed
+tests/windows/.passed
 
 # Python
 __pycache__/

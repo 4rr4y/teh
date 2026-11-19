@@ -9,7 +9,7 @@ class H(http.server.BaseHTTPRequestHandler):
         if last["role"] == "tool":
             msg = {"role": "assistant", "content": "RESULT: " + last["content"].strip()}
         else:
-            open(sys.argv[2], "w").write(req["messages"][0]["content"] + "\nTOOL: " + json.dumps(req["tools"][0]["function"]))
+            open(sys.argv[2], "w", encoding="utf-8").write(req["messages"][0]["content"] + "\nTOOL: " + json.dumps(req["tools"][0]["function"]))
             msg = {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function",
                    "function": {"name": "shell", "arguments": json.dumps({"command": CMD})}}]}
         b = json.dumps({"model": "fake", "choices": [{"finish_reason": "stop", "message": msg}],

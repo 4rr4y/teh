@@ -50,6 +50,16 @@ UNSAFE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u206
 def safe(s, mark="\N{REPLACEMENT CHARACTER}"):  # unsafe characters replaced: by a visible "�", or by mark
     return UNSAFE.sub(mark, s)
 
+def decode(data, cut=False):  # bytes from a command, or given on stdin -> text: UTF-8 (a BOM dropped) when it is,
+    data = data.removeprefix(b"\xef\xbb\xbf")  # else, on Windows, the system's ANSI code page, which older programs
+    try:                                       # still write. cut: the bytes were cut off at a size limit
+        return data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        if cut and e.reason == "unexpected end of data":  # UTF-8 cut in the middle of a character, at the limit
+            with contextlib.suppress(UnicodeDecodeError):
+                return data[:e.start].decode("utf-8") + "\N{REPLACEMENT CHARACTER}"
+        return data.decode("mbcs" if os.name == "nt" else "utf-8", errors="replace")
+
 
 # ######################################################################################################################
 # PART 1 · THE HARNESS: providers, settings, the model API, running commands, the conversation, chat
@@ -329,9 +339,31 @@ def find_shell(environ):  # -> (path, kind): TEH_SHELL if set, else the system's
 def powershell_prelude(python, script):  # defines the helpers for PowerShell, in place of their .cmd files
     # PowerShell drops the quotes from an argument without spaces when it runs a .cmd file, so cmd.exe would see the
     # & in an address like ?a=1&b=2 as a second command. A function of the same name (functions win over .cmd files)
-    # runs Python directly instead, so the address arrives intact; it passes on what's piped to it ($input).
+    # runs Python directly instead, so the address arrives intact; it passes on what's piped to it ($input), as UTF-8
+    # ($OutputEncoding, ASCII by default in Windows PowerShell). Every line works in PowerShell 1.0 too: $args, not
+    # @args (splatting is 2.0's). No progress bars: in a redirected stderr Windows PowerShell writes them as CLIXML.
     run = "& '" + python.replace("'", "''") + "' '" + script.replace("'", "''") + "'"  # single-quoted strings
-    return "".join(f"function {name} {{ $input | {run} {role} @args }}\n" for name, role in HELPERS.items())
+    return ("$ProgressPreference = 'SilentlyContinue'\n$OutputEncoding = New-Object System.Text.UTF8Encoding $false\n"
+            + "".join(f"function {name} {{ $input | {run} {role} $args }}\n" for name, role in HELPERS.items()))
+
+# How a PowerShell command runs, in a form PowerShell 1.0 can read as well as 7. The command arrives in base64 (only
+# letters, digits, + / =), so Windows' command-line quoting can't change it, and runs as a script block, so errors
+# point at its own lines. Not -EncodedCommand, with which Windows PowerShell writes errors to a redirected stderr as
+# CLIXML. The script block saves $? after the command's last statement: PowerShell itself would exit with 1 for any
+# failure, where the model needs a program's own exit code; and with a helper last, that helper's ($LASTEXITCODE),
+# as a function always leaves $? true.
+POWERSHELL_RUN = ("$global:TEH_OK = $true; $global:LASTEXITCODE = 0; function teh-block($b) {{ "
+                  "$ExecutionContext.InvokeCommand.NewScriptBlock([System.Text.Encoding]::Unicode.GetString("
+                  "[System.Convert]::FromBase64String($b))) }}; . (teh-block '{prelude}'); . (teh-block '{cmd}'); "
+                  "if ({helper_last} -and $LASTEXITCODE) {{ exit $LASTEXITCODE }}; "
+                  "if (-not $TEH_OK) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}")
+
+def helper_last(cmd):  # whether a PowerShell command's last statement runs a helper (a best guess, from the text)
+    last = re.split(r"[;|\n]", cmd.strip())[-1].strip()
+    return last.split(" ", 1)[0] in HELPERS
+
+def utf16_base64(text):
+    return base64.b64encode(text.encode("utf-16-le")).decode()
 
 # AGENTS.md is sent with every call, so a very long one costs on every call and fills the context window. Only this
 # many characters are used in all (Codex's default limit is the same, in bytes); the model is told where the rest is.
@@ -403,6 +435,8 @@ def setup_environment(environ):  # fills in the environment part of cfg; creates
     # TEH_SCRATCH, set here: the scratch folder, where the web helper saves its pages.
     cfg.command_env = {k: v for k, v in os.environ.items() if not k.upper().startswith("TEH_")}
     cfg.command_env["TEH_SCRATCH"] = cfg.scratch
+    if os.name == "nt":  # Python before 3.15 writes to a file in the old ANSI code page; teh reads output as UTF-8
+        cfg.command_env.setdefault("PYTHONIOENCODING", "utf-8")
 
     make_launchers()
     cfg.system = system_prompt(read_agents_md())
@@ -489,6 +523,8 @@ def setup_terminal():
     global COLOR
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(errors="replace")  # a character the console can't show becomes "?" instead of a crash
+        if os.name == "nt" and not stream.isatty():  # a file or a pipe: UTF-8, not the old ANSI code page (Python
+            stream.reconfigure(encoding="utf-8")       # 3.15 does this itself), where most text can't be written
     if os.name == "nt":
         os.system("")  # switches the Windows console into ANSI mode, so the dim colour works
     COLOR = sys.stderr.isatty()
@@ -620,9 +656,10 @@ def ask():  # -> None to run the command, else the message that tells the model 
     return "User declined." if answer.lower() in ("", "n", "no") else f"User declined: {answer}"
 
 def shell_argv(cmd):
-    if cfg.shell_kind in ("pwsh", "powershell"):  # an encoded command sidesteps Windows command-line quoting
-        return [cfg.shell, "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                base64.b64encode((cfg.prelude + cmd).encode("utf-16-le")).decode()]
+    if cfg.shell_kind in ("pwsh", "powershell"):  # see POWERSHELL_RUN
+        return [cfg.shell, "-NoProfile", "-NonInteractive", "-Command", POWERSHELL_RUN.format(
+            prelude=utf16_base64(cfg.prelude), cmd=utf16_base64(cmd + "\n$global:TEH_OK = $?"),
+            helper_last="$true" if helper_last(cmd) else "$false")]
     if cfg.shell_kind == "cmd":  # cmd parses its raw command line itself, so pass a string (as shell=True does)
         return f'"{cfg.shell}" /d /s /c "{cmd}"'
     return [cfg.shell, "-c", cmd]  # bash, zsh, sh, dash, fish, ...
@@ -759,19 +796,36 @@ def shell(cmd):  # run a command -> (its output, tidied; how it ended)
     # Output goes to a file, not a pipe, so a background job (`server &`) can keep writing without holding teh up.
     # stdin is empty, so a command that asks a question fails at once instead of waiting for an answer.
     with tempfile.TemporaryFile() as out:
-        p = subprocess.Popen(shell_argv(cmd), env=cfg.command_env, stdin=subprocess.DEVNULL, stdout=out,
-                             stderr=subprocess.STDOUT,
-                             start_new_session=os.name != "nt")
-        try:
-            code, end = wait(p, out)
-        except BaseException:  # Ctrl+C or exit: in its own session the command sees neither, so stop it here
-            stop(p)
-            raise
+        with utf8_console():
+            p = subprocess.Popen(shell_argv(cmd), env=cfg.command_env, stdin=subprocess.DEVNULL, stdout=out,
+                                 stderr=subprocess.STDOUT,
+                                 start_new_session=os.name != "nt")
+            try:
+                code, end = wait(p, out)
+            except BaseException:  # Ctrl+C or exit: in its own session the command sees neither, so stop it here
+                stop(p)
+                raise
         state.commands.append({"command": cmd, "exit": code})  # exit None: stopped (timed out, or too much output)
         if code is not None and os.fstat(out.fileno()).st_size > OUTPUT_MAX_BYTES:  # it wrote that much, quickly
             end += f" [output cut off at {OUTPUT_MAX_BYTES:,} bytes]"
         out.seek(0)
-        return tidy(out.read(OUTPUT_MAX_BYTES).decode(errors="replace")), end
+        data = out.read(OUTPUT_MAX_BYTES)
+        return tidy(decode(data, cut=bool(out.read(1)))), end
+
+@contextlib.contextmanager
+def utf8_console():  # Windows: UTF-8 as the console's output code page while a command runs, and the old one after
+    # cmd's own commands (echo, type, dir) and PowerShell write output to a file in the console's code page, an old
+    # one (437, 850, …) unless changed, in which most of the world's text can't be written. The console is the
+    # user's terminal too, so it's changed back at once. Without a console (a scheduled task), nothing to change.
+    kernel32 = getattr(__import__("ctypes"), "windll").kernel32 if os.name == "nt" else None
+    before = kernel32.GetConsoleOutputCP() if kernel32 else 0
+    if before and before != 65001:
+        kernel32.SetConsoleOutputCP(65001)
+    try:
+        yield
+    finally:
+        if before and before != 65001:
+            kernel32.SetConsoleOutputCP(before)
 
 # ===== Conversation: token accounting and the model <-> command loop ================================================
 EXIT_CODES = {"done": 0, "error": 1, "refused": 2, "context_full": 3, "cut_off": 4, "budget": 5,  # how turns end
@@ -977,13 +1031,13 @@ def read_prompt():  # a pasted block is one prompt, not one per line; a line end
     return "\n".join(lines).strip()
 
 def piped_input():  # stdin, for the prompt: tidied like command output, any bytes accepted (a log may have stray ones)
-    sys.stdin.reconfigure(errors="replace")
-    text = sys.stdin.read(OUTPUT_MAX_BYTES)
-    more = sys.stdin.read(1)
+    data = sys.stdin.buffer.read(OUTPUT_MAX_BYTES)  # bytes: on Windows the code page isn't what was piped
+    more = sys.stdin.buffer.read(1)
+    text = decode(data, cut=bool(more))
     # Meant to be read whole, so cut only if it would take more than half the context window (about 4 characters a
     # token): the first and last parts, with the whole of it saved for grep
     text = clip(tidy(text), limit=cfg.context_window * 2)
-    return text + (f"\n[… input cut off at {OUTPUT_MAX_BYTES:,} characters]" if more else "")
+    return text + (f"\n[… input cut off at {OUTPUT_MAX_BYTES:,} bytes]" if more else "")
 
 # ===== Main: one-shot (task given or piped) or chat =================================================================
 def main():
@@ -1799,7 +1853,7 @@ def edit_main(args):  # teh.py --edit FILE < BLOCKS -> exit code
     setup_helper_output()
     path = Path(args[0])
     try:
-        blocks = edit_blocks(sys.stdin.read())
+        blocks = edit_blocks(decode(sys.stdin.buffer.read()))  # bytes: the console's code page isn't the input's
     except ValueError as e:
         raise SystemExit(f"not edited: {e}") from None
     if not path.exists():  # a new file: one block, with an empty SEARCH

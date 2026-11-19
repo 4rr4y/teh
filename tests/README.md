@@ -5,6 +5,7 @@ tests/
   test_units.py   unit tests: plain Python, run on every system  (cd tests && python3 -m unittest test_units)
   fakes/          fake API servers on localhost, plain Python: shared by every system's suites
   unix/           Linux and macOS: bash suites, and a pseudo-terminal for chat  (tests/unix/run.sh)
+  windows/        Windows: Python suites, for cmd and PowerShell  (python tests\windows\run.py)
 ```
 
 No test needs an API key or the network: `teh` is pointed at a fake server (`TEH_BASE_URL=http://127.0.0.1:PORT`)
@@ -17,21 +18,36 @@ and waits until it accepts connections, `check` records a pass or a failure, `on
 exit code. `pty_run.py` drives chat in a pseudo-terminal, typing each input when `teh` shows a prompt. `inputs.py`
 works out what each suite depends on, for `run.sh --changed`.
 
-## Adding Windows suites (`tests/windows/`, not written yet)
+## The Windows suites (`tests/windows/`)
 
-What carries over unchanged: `test_units.py`, and every server in `fakes/` (plain Python; their scripted commands are
-mostly `echo`, which PowerShell and cmd have too, but read each script: a few use `sleep` or Unix paths).
+```
+python tests\windows\run.py              every suite (about 40 seconds)
+python tests\windows\run.py core fetch   some of them
+python tests\windows\run.py --changed    only the suites affected by what changed since they last passed
+```
 
-What needs writing, in PowerShell (`run.ps1`, `test_<suite>.ps1`), suite by suite after the Unix ones:
+Written in Python, so they need nothing but Python 3.10 or later: no bash, no extra packages. The suites have the
+Unix suites' names (`units`, `core`, `chat`, `caching`, `errors`, `output`, `compact`, `fetch`) and cover the same
+ground, plus what's Windows' own. GitHub Actions runs them on each push and pull request, on Windows with Python 3.10,
+3.12 and 3.14.
 
-- **`serve` and `check`:** start a fake server in the background (`Start-Process python -ArgumentList ...`), wait for
-  its port, stop it at the end; count passes and failures.
-- **Commands as the model runs them:** `teh` runs the model's commands in PowerShell (or cmd) on Windows, with
-  `teh-fetch` and `teh-edit` as functions (PowerShell) or `.cmd` launchers (cmd). The Windows suites are where these
-  paths get tested for the first time: quoting (an address with `&`), UTF-8 output, `Start-Job` in the parallel advice.
-- **Chat:** `pty_run.py` needs a Unix pseudo-terminal. On Windows, start with the one-shot suites (`core`, `output`,
-  `errors`, `caching`, `compact`, `fetch`); chat needs a console driver (e.g. the `pywinpty` package) or a test of the
-  chat loop through its functions instead.
-- **Signals:** Windows has no SIGHUP; the scratch folder cleanup on closing the console is the case to test there.
+- **`run.py`** runs the unit tests, then each `test_<suite>.py`; `--changed` works as on Unix, with `inputs.py`.
+- **`lib.py`** has what the suites share: `Suite.serve` starts a fake server (and refuses a port already in use),
+  `ready` waits until the servers accept connections, `teh` runs `teh` once and returns its exit code and output,
+  `script` starts a fake model that has `teh` run a list of commands, `check` records a pass or a failure.
+- **The shells:** the model's commands run in cmd and in Windows PowerShell, and in PowerShell 7 (`pwsh`) where it's
+  installed (it is on GitHub's runners), each in its own syntax: quoting, exit codes, `teh-fetch` and `teh-edit` (a
+  `.cmd` launcher in cmd, a function in PowerShell, with an `&` in an address), timeouts that stop a whole process
+  tree, background jobs, the system prompt's advice for each shell, and which shell is picked without `TEH_SHELL`.
+- **Chat:** there's no pseudo-terminal on Windows, so `chat_run.py` runs `teh` in its own process with the console
+  replaced: input that says it's a terminal, and `msvcrt.kbhit` telling a paste from typed lines. It covers
+  approvals, chat commands, chat input, the startup segment, `/clear` and `/compact`. The live thinking timer needs
+  a real console, and isn't tested.
+- **Ctrl+C:** Windows sends it to every process on a console, not to one, so `ctrl_c.py` runs `teh` in a hidden console
+  of its own and presses Ctrl+C there (`output` suite).
+- **No console:** a run started without one (a scheduled task, a service) is tested too (`output` suite).
 
-Keep the suites' names, so `units`, `core`, `chat` and so on mean the same tests on every system.
+**Known problems** are checked with `Suite.known` rather than `check`: they show as `KNOWN` with what's wrong, and
+don't fail the suite, so the suites stay green while they're open. One that starts to pass says so; then make it a
+`check`. None is open now: the three the suites found first (non-ASCII output in the console's code page, Windows
+PowerShell's CLIXML on a redirected stderr, and helpers' exit codes lost in PowerShell) are fixed, and checked.

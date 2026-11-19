@@ -23,3 +23,20 @@ jobs:
         run: sudo apt-get install -y --no-install-recommends bc
       - name: Unit tests and the Unix suites
         run: bash tests/unix/run.sh
+
+  windows:
+    name: tests (Windows, Python ${{ matrix.python }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # Only Python is needed. The suites run the model's commands in cmd, Windows PowerShell and PowerShell 7 (pwsh),
+      # all three on the runner.
+      - name: Unit tests and the Windows suites
+        run: python tests/windows/run.py
