@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Checks the benchmark's tasks themselves, without a model: for each task, doing nothing must fail its check, and a
 reference solution must pass it. Run it after adding or changing a task: python3 bench/selftest.py [task ...]"""
-import csv, difflib, io, json, re, shutil, sys, tempfile
+import csv
+import re
+import shutil
+import sys
+import tempfile
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "tasks"))
-from run import load_tasks  # noqa: E402
+from run import load_tasks
 
 
 def text(d, name, content):
@@ -18,7 +22,7 @@ def text(d, name, content):
 # ===== Reference solutions: (folder) -> the final answer; they change files like the model would ====================
 def sales_report(d):
     totals = Counter()
-    for row in csv.DictReader(open(d / "sales.csv")):
+    for row in csv.DictReader((d / "sales.csv").read_text().splitlines()):
         if "2025-07" <= row["date"][:7] <= "2025-09":
             totals[row["region"]] += int(row["units"]) * float(row["unit_price"])
     region, total = totals.most_common(1)[0]
@@ -36,7 +40,7 @@ def sort_photos(d):
 
 def access_log(d):
     hours, ips = Counter(), Counter()
-    for line in open(d / "access.log"):
+    for line in (d / "access.log").read_text().splitlines():
         m = re.match(r'(\S+) .*?\[(\d\d)/(\w\w\w)/(\d{4}):(\d\d).*?" (\d{3}) ', line)
         if int(m[6]) >= 500:
             hours[f"{m[4]}-{m[3]}-{m[2]} {m[5]}:00"] += 1
@@ -58,16 +62,17 @@ def meetings_ics(d):
     return "Created meetings.ics"
 
 def bank_budget(d):
-    rules = [line.split("=") for line in open(d / "categories.txt") if "=" in line and not line.startswith("#")]
+    lines = (d / "categories.txt").read_text().splitlines()
+    rules = [line.split("=") for line in lines if "=" in line and not line.startswith("#")]
     rules = [(k.strip().lower(), v.strip()) for k, v in rules]
     spend = []  # (date, description, amount spent)
-    for row in csv.DictReader(open(d / "bank_a.csv")):
+    for row in csv.DictReader((d / "bank_a.csv").read_text().splitlines()):
         spend.append((datetime.strptime(row["Date"], "%d/%m/%Y"), row["Description"], -float(row["Amount"])))
-    for row in csv.DictReader(open(d / "bank_b.csv"), delimiter=";"):
+    for row in csv.DictReader((d / "bank_b.csv").read_text().splitlines(), delimiter=";"):
         if row["debit"]:
             spend.append((datetime.strptime(row["date"], "%Y-%m-%d"), row["payee"],
                           float(row["debit"].replace(",", "."))))
-    for line in open(d / "card_c.txt"):
+    for line in (d / "card_c.txt").read_text().splitlines():
         m = re.match(r"(\d\d \w\w\w \d\d)\s{2,}(.+?)\s{2,}(-?[\d.]+)$", line.rstrip())
         if m:
             spend.append((datetime.strptime(m[1].title(), "%d %b %y"), m[2], float(m[3])))
@@ -82,7 +87,7 @@ def bank_budget(d):
     return "Written summary.csv"
 
 def dedupe_contacts(d):
-    rows, seen, out = list(csv.reader(open(d / "contacts.csv"))), set(), []
+    rows, seen, out = list(csv.reader((d / "contacts.csv").read_text().splitlines())), set(), []
     for row in rows[1:]:
         key = row[1].strip().lower()
         if key not in seen:
@@ -97,7 +102,7 @@ def policy_lookup(d):
 
 def mail_merge(d):
     template = (d / "template.txt").read_text()
-    for p in csv.DictReader(open(d / "people.csv")):
+    for p in csv.DictReader((d / "people.csv").read_text().splitlines()):
         if p["status"] != "declined":
             letter = template
             for field, column in (("First name", "first_name"), ("Event", "event"), ("Date", "date"),
@@ -108,7 +113,7 @@ def mail_merge(d):
 
 def tos_changes(d):
     def parse(name):
-        parts = re.split(r"^§ (\d+)  (.*)$", (d / name).read_text(), flags=re.M)
+        parts = re.split(r"^§ (\d+)  (.*)$", (d / name).read_text(), flags=re.MULTILINE)
         return {int(parts[i]): (parts[i + 1], parts[i + 2]) for i in range(1, len(parts), 3)}
     a, b = parse("terms_v1.txt"), parse("terms_v2.txt")
     lines = []
@@ -150,8 +155,9 @@ def cli_top_flag(d):
     p = d / "wordcount.py"
     p.write_text(p.read_text().replace('    parser.add_argument("file")\n',
                                        '    parser.add_argument("file")\n    parser.add_argument("--top", type=int)\n')
-                 .replace('different")\n', 'different")\n    if args.top:\n        for word, n in sorted(counts.items(), '
-                          'key=lambda x: (-x[1], x[0]))[:args.top]:\n            print(word, n)\n'))
+                 .replace('different")\n', 'different")\n    if args.top:\n'
+                          '        for word, n in sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:args.top]:\n'
+                          '            print(word, n)\n'))
     return "Added"
 
 def js_duration(d):
@@ -238,14 +244,14 @@ def xl_lang_bugs(d):
 FEATURE_PATCHES = [
     ("minilang/lexer.py", '"and", "or", "not"}', '"and", "or", "not", "for", "in", "break",\n            "continue"}'),
     ("minilang/ast.py", "@dataclass\nclass Return:",
-     "@dataclass\nclass For:\n    name: str\n    iterable: object\n    body: Block\n\n\n@dataclass\nclass Break:\n"
-     "    line: int = 0\n\n\n@dataclass\nclass Continue:\n    line: int = 0\n\n\n@dataclass\nclass Return:"),
+     ("@dataclass\nclass For:\n    name: str\n    iterable: object\n    body: Block\n\n\n@dataclass\nclass Break:\n"
+     "    line: int = 0\n\n\n@dataclass\nclass Continue:\n    line: int = 0\n\n\n@dataclass\nclass Return:")),
     ("minilang/parser.py", "Num, Program, Return, Str, Unary, While)",
      "Num, Program, Return, Str, Unary, While, For, Break, Continue)"),
     ("minilang/parser.py", "        self.tokens, self.pos = tokens, 0\n",
      "        self.tokens, self.pos = tokens, 0\n        self.loops = 0\n"),
     ("minilang/parser.py", "            cond = self.expression()\n            return While(cond, self.block())\n",
-     "            cond = self.expression()\n            return While(cond, self.loop_body())\n"
+     ("            cond = self.expression()\n            return While(cond, self.loop_body())\n"
      "        if self.at(\"kw\", \"for\"):\n            self.next()\n            name = self.expect(\"name\").value\n"
      "            self.expect(\"kw\", \"in\")\n            iterable = self.expression()\n"
      "            return For(name, iterable, self.loop_body())\n"
@@ -253,34 +259,37 @@ FEATURE_PATCHES = [
      "            if not self.loops:\n"
      "                raise ParseError(f\"{token.value} outside a loop\", token.line)\n"
      "            self.expect(\"op\", \";\")\n"
-     "            return (Break if token.value == \"break\" else Continue)(token.line)\n"),
+     "            return (Break if token.value == \"break\" else Continue)(token.line)\n")),
     ("minilang/parser.py", "    def if_statement(self):",
-     "    def loop_body(self):\n        self.loops += 1\n        try:\n            return self.block()\n"
-     "        finally:\n            self.loops -= 1\n\n    def if_statement(self):"),
+     ("    def loop_body(self):\n        self.loops += 1\n        try:\n            return self.block()\n"
+     "        finally:\n            self.loops -= 1\n\n    def if_statement(self):")),
     ("minilang/parser.py", "        self.expect(\"op\", \")\")\n        return params, self.block()\n",
-     "        self.expect(\"op\", \")\")\n        outer, self.loops = self.loops, 0\n        try:\n"
-     "            return params, self.block()\n        finally:\n            self.loops = outer\n"),
+     ("        self.expect(\"op\", \")\")\n        outer, self.loops = self.loops, 0\n        try:\n"
+     "            return params, self.block()\n        finally:\n            self.loops = outer\n")),
     ("minilang/interpreter.py", "class Interpreter:",
      "class BreakSignal(Exception):\n    pass\n\n\nclass ContinueSignal(Exception):\n    pass\n\n\nclass Interpreter:"),
     ("minilang/interpreter.py",
      "        while truthy(self.eval(node.cond, env)):\n            self.exec_Block(node.body, env)\n",
-     "        while truthy(self.eval(node.cond, env)):\n            try:\n                self.exec_Block(node.body, env)\n"
-     "            except BreakSignal:\n                break\n            except ContinueSignal:\n                continue\n\n"
+     ("        while truthy(self.eval(node.cond, env)):\n            try:\n"
+     "                self.exec_Block(node.body, env)\n"
+     "            except BreakSignal:\n                break\n"
+     "            except ContinueSignal:\n                continue\n\n"
      "    def exec_For(self, node, env):\n        items = self.eval(node.iterable, env)\n"
      "        if not isinstance(items, (list, str)):\n"
      "            raise EvalError(f\"can't loop over a {type_name(items)}\")\n        i = 0\n"
-     "        while i < len(items):\n            scope = Environment(env)\n            scope.define(node.name, items[i])\n"
+     "        while i < len(items):\n            scope = Environment(env)\n"
+     "            scope.define(node.name, items[i])\n"
      "            i += 1\n            try:\n                for stmt in node.body.stmts:\n"
      "                    self.execute(stmt, scope)\n            except BreakSignal:\n                break\n"
      "            except ContinueSignal:\n                continue\n\n"
      "    def exec_Break(self, node, env):\n        raise BreakSignal()\n\n"
-     "    def exec_Continue(self, node, env):\n        raise ContinueSignal()\n"),
+     "    def exec_Continue(self, node, env):\n        raise ContinueSignal()\n")),
     ("minilang/formatter.py", "    if isinstance(node, ast.If):\n",
-     "    if isinstance(node, ast.For):\n"
+     ("    if isinstance(node, ast.For):\n"
      "        return f\"{pad}for {node.name} in {expr(node.iterable, depth)} {block(node.body, depth)}\\n\"\n"
      "    if isinstance(node, ast.Break):\n        return f\"{pad}break;\\n\"\n"
      "    if isinstance(node, ast.Continue):\n        return f\"{pad}continue;\\n\"\n"
-     "    if isinstance(node, ast.If):\n"),
+     "    if isinstance(node, ast.If):\n")),
 ]
 FEATURE_TEST = '''import unittest
 
@@ -348,7 +357,7 @@ def main():
     for name, task in tasks.items():
         d = Path(tempfile.mkdtemp(prefix=f"selftest-{name}-"))
         task.setup(d)
-        before, why_before = (task.check(d, "") if not task.WEB else (False, "web: not checked offline"))
+        before, _why_before = (task.check(d, "") if not task.WEB else (False, "web: not checked offline"))
         solve = globals().get(name)
         answer = solve(d) if solve else ANSWERS[name]
         after, why_after = task.check(d, answer)

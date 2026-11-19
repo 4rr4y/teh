@@ -92,13 +92,13 @@ teh · startup
   keys     Ctrl+C cancels the current turn · Ctrl+D exits
 
 > why does make fail?
-· claude-opus-5-5 · default · 2.8s · in 2,301 · out 64 · Σ 2,365 · ctx 2,365/262,144 (1%)
+· anthropic · claude-opus-5-5 · default · 2.8s · in 2,301 · out 64 · Σ 2,365 · ctx 2,365/262,144 (1%)
 
 $ make 2>&1 | tail -15
 run? [y]es · [a]ll · [N]o, or type what to do instead: y
 
 The linker can't find libssl. Install it with `sudo apt install libssl-dev`, then run make again.
-· claude-opus-5-5 · default · 3.4s · in 2,980 (2,301 cached) · out 41 · Σ 5,386 (2,301 cached) · ctx 3,021/262,144 (1%)
+· anthropic · claude-opus-5-5 · default · 3.4s · in 2,980 (2,301 cached) · out 41 · Σ 5,386 (2,301 cached) · ctx 3,021/262,144 (1%)
 
 >
 ```
@@ -359,11 +359,13 @@ teh "fix the failing tests"
 ## The status line
 
 ```
-· claude-opus-5-5 · medium · 12.4s · in 48,210 (45,900 cached) · out 1,204 · Σ 312,877 (241,350 cached) · ctx 49,414/262,144 (19%)
+· anthropic · claude-opus-5-5 · medium · 12.4s · in 48,210 (45,900 cached) · out 1,204 · Σ 312,877 (241,350 cached) · ctx 49,414/262,144 (19%)
 ```
 
 | Field | Meaning |
 |---|---|
+| `anthropic` | The provider: its shortcut name (also for a URL on the same server), else the URL's host (non-ASCII names in their `xn--` form, so lookalike letters stand out); `custom` for a server on this machine or a private network that isn't a known one, e.g. a llama.cpp server on `localhost:8080` |
+| `claude-opus-5-5` · `medium` | The model that answered, and the effort (`default`: the provider's own) |
 | `12.4s` | How long the reply took, including retries |
 | `in` (`cached`) | Input tokens for this call: the whole conversation, resent every call. The cached part costs about a tenth as much |
 | `out` | Output tokens for this reply |
@@ -400,29 +402,38 @@ While waiting, a live `· thinking… 7s` timer is shown, in a terminal only.
 
 ## Tests
 
-No API key, no network: the tests run against fake API servers on your machine.
-
-Linux and macOS (sh, bash, zsh):
+No API key, no network: the tests run against fake API servers on your machine. They need only Python, and run the
+same way on Linux, macOS and Windows (use `python3` where `python` is Python 2, and `\` in paths on Windows):
 
 ```sh
-tests/unix/run.sh              # every suite (about 30 seconds)
-tests/unix/run.sh core fetch   # some of them
-tests/unix/run.sh --changed    # only the suites affected by what changed since they last passed
-cd tests && python3 -m unittest test_units   # the unit tests alone
+python tests/e2e/run.py              # every suite (about a minute)
+python tests/e2e/run.py core fetch   # some of them
+python tests/e2e/run.py --changed    # only the suites affected by what changed since they last passed
+cd tests && python -m unittest test_units   # the unit tests alone
 ```
 
-Windows (cmd or PowerShell; Python only, the suites run commands in cmd and PowerShell themselves):
+The suites run the model's commands in each of the system's shells: bash and sh (and zsh where it's installed), or cmd
+and Windows PowerShell (and PowerShell 7 where it's installed).
 
-```bat
-python tests\windows\run.py              & rem every suite (about 40 seconds)
-python tests\windows\run.py core fetch   & rem some of them
-python tests\windows\run.py --changed    & rem only the suites affected by what changed since they last passed
-cd tests && python -m unittest test_units
+### Linting (for development only)
+
+> **Only for working on teh's code.** You don't need ruff, or anything in `requirements-dev.txt`, to use teh: it
+> still needs nothing but Python. Skip this section unless you're changing teh and want to check your changes as CI
+> will.
+
+The code is checked with [ruff](https://docs.astral.sh/ruff/), with the rules in `ruff.toml`: the same check locally
+and in CI, at the version pinned in `requirements-dev.txt`.
+
+```sh
+pip install -r requirements-dev.txt   # once: development tools only, not needed to use teh
+ruff check                            # lint, from the repository's root
+git config core.hooksPath .githooks   # once per clone: lint and unit tests before every push
 ```
 
-In PowerShell, the same lines without the `& rem` comments (`#` there).
+With the hook on, a push that would fail the lint check or the unit tests stops before it leaves
+(`git push --no-verify` pushes anyway).
 
-GitHub Actions runs every suite on each push and pull request, on Linux and on Windows, with Python 3.10, 3.12 and 3.14. What each suite covers, and how they're built, is in [DESIGN.md](DESIGN.md#tests) and [`tests/README.md`](tests/README.md).
+GitHub Actions runs the lint check and every suite on each push and pull request, on Linux and on Windows, with Python 3.10, 3.12 and 3.14. What each suite covers, and how they're built, is in [DESIGN.md](DESIGN.md#tests) and [`tests/README.md`](tests/README.md).
 
 ## Acknowledgements
 

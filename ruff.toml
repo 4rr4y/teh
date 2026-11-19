@@ -1,0 +1,11 @@
+# Linting with ruff (https://docs.astral.sh/ruff/), the same check locally and in CI: `ruff check`, from the
+# repository's root. The version is pinned in requirements-dev.txt.
+line-length = 120
+target-version = "py310"
+# The benchmark's task fixtures: projects for the model to work on, some with bugs planted on purpose
+extend-exclude = ["bench/tasks"]
+
+[lint]
+# Ruff's defaults (pyflakes, pycodestyle's errors, import order, and checks for common bugs and simpler code), and the
+# 120-character line length
+extend-select = ["E501"]

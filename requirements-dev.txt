@@ -1,0 +1,2 @@
+# Tools for working on teh (teh itself needs nothing but Python). Install: pip install -r requirements-dev.txt
+ruff==0.17.5

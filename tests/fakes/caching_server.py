@@ -1,31 +1,38 @@
-# Port 8781, both formats.
-# logs every request (headers + body) as one JSON line; answers with one tool call, then text.
-# The usage block in the reply depends on the URL path: /usage-deepseek/, /usage-header/, /usage-top/, else OpenAI style.
-import json, http.server, sys
-class H(http.server.BaseHTTPRequestHandler):
+"""Port 8781, both formats: logs every request (path, headers and body) as one JSON line to argv[1], and answers with
+one tool call, then text. The usage it reports depends on the URL path: /usage-deepseek/, /usage-header/ (a header,
+as Fireworks reports it), /usage-top/, else OpenAI's."""
+import json
+import sys
+
+from common import Handler, openai_reply, read_json, send_json, serve, text, tool_call
+
+USAGES = {"/usage-deepseek/": {"prompt_tokens": 100, "completion_tokens": 1, "prompt_cache_hit_tokens": 77},
+          "/usage-top/": {"prompt_tokens": 100, "completion_tokens": 1, "cached_tokens": 55},
+          "/usage-header/": {"prompt_tokens": 100, "completion_tokens": 1}}
+OPENAI_USAGE = {"prompt_tokens": 100, "completion_tokens": 1, "prompt_tokens_details": {"cached_tokens": 88}}
+
+def tool_result(message):
+    """Whether a message carries a tool's result, in either format."""
+    content = message.get("content")
+    return message.get("role") == "tool" or (isinstance(content, list) and content
+                                             and content[0].get("type") == "tool_result")
+
+class H(Handler):
     def do_POST(self):
-        req = json.loads(self.rfile.read(int(self.headers["content-length"])))
-        open(sys.argv[1], "a").write(json.dumps({"path": self.path, "headers": dict(self.headers), "body": req}) + "\n")
-        first = not any(m.get("role") == "tool" or isinstance(m.get("content"), list) and m["content"]
-                        and m["content"][0].get("type") == "tool_result" for m in req["messages"])
-        extra = {}
-        if "/usage-deepseek/" in self.path: usage = {"prompt_tokens": 100, "completion_tokens": 1, "prompt_cache_hit_tokens": 77}
-        elif "/usage-top/" in self.path: usage = {"prompt_tokens": 100, "completion_tokens": 1, "cached_tokens": 55}
-        elif "/usage-header/" in self.path: usage = {"prompt_tokens": 100, "completion_tokens": 1}; extra = {"fireworks-cached-prompt-tokens": "66"}
-        else: usage = {"prompt_tokens": 100, "completion_tokens": 1, "prompt_tokens_details": {"cached_tokens": 88}}
+        """Log the request; answer the first with a tool call, the next with "done"."""
+        req = read_json(self)
+        with open(sys.argv[1], "a") as log:
+            log.write(json.dumps({"path": self.path, "headers": dict(self.headers), "body": req}) + "\n")
+        first = not any(tool_result(m) for m in req["messages"])
+        usage = next((u for part, u in USAGES.items() if part in self.path), OPENAI_USAGE)
+        headers = {"fireworks-cached-prompt-tokens": "66"} if "/usage-header/" in self.path else {}
         if self.path.endswith("/messages"):
             content = ([{"type": "tool_use", "id": "t1", "name": "shell", "input": {"command": "echo hi"}}] if first
                        else [{"type": "text", "text": "done"}])
-            r = {"model": "fake", "stop_reason": "tool_use" if first else "end_turn", "content": content,
-                 "usage": {"input_tokens": 10, "cache_read_input_tokens": 90, "output_tokens": 1}}
+            reply = {"model": "fake", "stop_reason": "tool_use" if first else "end_turn", "content": content,
+                     "usage": {"input_tokens": 10, "cache_read_input_tokens": 90, "output_tokens": 1}}
         else:
-            msg = ({"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function",
-                    "function": {"name": "shell", "arguments": "{\"command\": \"echo hi\"}"}}]} if first
-                   else {"role": "assistant", "content": "done"})
-            r = {"model": "fake", "choices": [{"finish_reason": "stop", "message": msg}], "usage": usage}
-        b = json.dumps(r).encode()
-        self.send_response(200); self.send_header("content-length", len(b))
-        for k, v in extra.items(): self.send_header(k, v)
-        self.end_headers(); self.wfile.write(b)
-    def log_message(self, *a): pass
-http.server.HTTPServer(("127.0.0.1", 8781), H).serve_forever()
+            reply = openai_reply(tool_call("echo hi") if first else text("done"), usage)
+        send_json(self, reply, headers=headers)
+
+serve(8781, H)

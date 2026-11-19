@@ -1,0 +1,14 @@
+#!/bin/sh
+# Before every push: the lint check CI runs (ruff), and the unit tests (a few seconds), so a push that would fail
+# them doesn't leave. Enable it once per clone: git config core.hooksPath .githooks
+# To push anyway: git push --no-verify
+cd "$(git rev-parse --show-toplevel)" || exit 1
+if ! command -v ruff >/dev/null 2>&1; then
+    echo "pre-push: ruff isn't installed. Install it with: pip install -r requirements-dev.txt" >&2
+    exit 1
+fi
+echo "pre-push: ruff check"
+ruff check || exit 1
+echo "pre-push: unit tests"
+python=$(command -v python3 || command -v python)
+cd tests && "$python" -B -m unittest -q test_units

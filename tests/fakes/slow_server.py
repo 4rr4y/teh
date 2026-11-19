@@ -1,11 +1,18 @@
-# Port 8768, OpenAI format: waits 3.5s before answering 'done' (thinking-timer tests)
-import json, http.server, time
-class H(http.server.BaseHTTPRequestHandler):
+"""Port 8768, OpenAI format: waits 3.5s, then answers "done" (thinking timer and Ctrl+C tests)."""
+import time
+
+from common import Handler, openai_reply, read_json, send_json, serve, text
+
+
+class H(Handler):
     def do_POST(self):
-        self.rfile.read(int(self.headers["content-length"])); time.sleep(3.5)
-        b = json.dumps({"model": "fake", "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "done"}}],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 1}}).encode()
-        try: self.send_response(200); self.send_header("content-length", len(b)); self.end_headers(); self.wfile.write(b)
-        except (BrokenPipeError, ConnectionResetError): pass  # the client was cancelled (Ctrl+C test) and has gone
-    def log_message(self, *a): pass
-http.server.HTTPServer(("127.0.0.1", 8768), H).serve_forever()
+        """Answer "done", slowly."""
+        read_json(self)
+        time.sleep(3.5)
+        try:
+            send_json(self, openai_reply(text("done")))
+        except (BrokenPipeError, ConnectionResetError):
+            # The client was cancelled (the Ctrl+C test) and has gone
+            pass
+
+serve(8768, H)

@@ -1,19 +1,23 @@
-# Port 8767, OpenAI format.
-# replies with one tool call running CMD, then echoes the tool result back as the answer; logs the system prompt
-import json, http.server, sys
-CMD = sys.argv[1]
-class H(http.server.BaseHTTPRequestHandler):
+"""Port 8767, OpenAI format: one tool call running the command argv[1], then the tool's result echoed back as the
+answer. Logs the system prompt and the tool's definition to argv[2]."""
+import json
+import sys
+
+from common import Handler, openai_reply, read_json, send_json, serve, text, tool_call
+
+COMMAND = sys.argv[1]
+
+class H(Handler):
     def do_POST(self):
-        req = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        """Answer the first request with the tool call, the next with its result."""
+        req = read_json(self)
         last = req["messages"][-1]
         if last["role"] == "tool":
-            msg = {"role": "assistant", "content": "RESULT: " + last["content"].strip()}
+            msg = text("RESULT: " + last["content"].strip())
         else:
-            open(sys.argv[2], "w", encoding="utf-8").write(req["messages"][0]["content"] + "\nTOOL: " + json.dumps(req["tools"][0]["function"]))
-            msg = {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function",
-                   "function": {"name": "shell", "arguments": json.dumps({"command": CMD})}}]}
-        b = json.dumps({"model": "fake", "choices": [{"finish_reason": "stop", "message": msg}],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 1}}).encode()
-        self.send_response(200); self.send_header("content-length", len(b)); self.end_headers(); self.wfile.write(b)
-    def log_message(self, *a): pass
-http.server.HTTPServer(("127.0.0.1", 8767), H).serve_forever()
+            with open(sys.argv[2], "w", encoding="utf-8") as log:
+                log.write(req["messages"][0]["content"] + "\nTOOL: " + json.dumps(req["tools"][0]["function"]))
+            msg = tool_call(COMMAND)
+        send_json(self, openai_reply(msg))
+
+serve(8767, H)

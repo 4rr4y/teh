@@ -87,7 +87,7 @@ Commands run in one shell, chosen at startup:
 
 The model is told the OS and shell so it uses the right syntax, and the token-saving advice in the system prompt comes in that shell's own syntax (the `SHELL_EXAMPLES` table).
 
-**On Windows**, both shells are tested on every push (`tests/windows/`):
+**On Windows**, both shells are tested on every push (`tests/e2e/`, as are bash and sh elsewhere):
 - **cmd:** commands run as `cmd /d /s /c "…"`, as Python's `shell=True` does. The helpers are `.cmd` launchers.
 - **PowerShell, every version from 1.0 to 7:** `teh` doesn't need PowerShell 7. It uses `pwsh` when that's installed, else the `powershell` that comes with Windows, and what it adds to each command is written to work in PowerShell 1.0 too (the oldest Windows that runs Python 3.10, Windows 8.1, comes with 4.0). Windows PowerShell 5.1 and PowerShell 7 are tested. A command reaches PowerShell in base64, so Windows' command-line quoting can't change it, and runs as a script block (`POWERSHELL_RUN`). Not `-EncodedCommand`, with which Windows PowerShell writes errors to a redirected stderr as CLIXML: errors come as plain text, and progress bars are switched off. The exit code is the failing program's own (`[exit 5]`), or 1 when a PowerShell command fails last; when a helper is the command's last statement, its exit code is used, as a PowerShell function always leaves `$?` true. The system prompt's advice to run slow commands in parallel uses `Start-Job`, from PowerShell 2.0.
 - **Non-English text:** while a command runs, `teh` switches the console to UTF-8 (and back afterwards), so cmd's and PowerShell's own output comes through whole, and has Python write UTF-8 too (`PYTHONIOENCODING`, unless you've set it). `teh`'s own output, when it goes to a file or a pipe, is UTF-8 too.
@@ -190,7 +190,7 @@ Each result is three lines: title, link and details (e.g. votes and answers, sta
 
 **Limits:** the helper keeps requests to each source far enough apart for its limit, even across separate runs (a timestamp file in the scratch folder). If a source still refuses (HTTP 403, 429, or 503, which is how MusicBrainz says "too fast"), the message gives its limit and suggests waiting or another source.
 
-**Identifying yourself for higher limits:** some sources give clients with contact details in their user agent more room: Wikimedia 200 requests a minute instead of 10, Open Library 3 a second instead of 1; MusicBrainz and OpenStreetMap ask for it, and Crossref serves such clients from its "polite pool". `WEB_CONTACT`, at the top of the web helper in `teh.py`, is an email or a URL that those sites (only) get in the user agent `teh-fetch/0.1 (<contact>) teh/3.x` (the `3.x` is the Python version); every other site keeps the anonymous user agent. It's set to `teh@teh.com` by default: replace it with your own email or URL, or set it to `""` to send nothing.
+**Identifying yourself for higher limits:** some sources give clients with contact details in their user agent more room: Wikimedia 200 requests a minute instead of 10, Open Library 3 a second instead of 1; MusicBrainz and OpenStreetMap ask for it, and Crossref serves such clients from its "polite pool". `WEB_CONTACT`, at the top of the web helper in `teh.py`, is an email or a URL that those sites (only) get in the user agent `teh-fetch/0.1 (<contact>)` (teh's version, `__version__`); every other site keeps the anonymous user agent. It's set to `teh@teh.com` by default: replace it with your own email or URL, or set it to `""` to send nothing.
 
 **Left out after testing:** Semantic Scholar, GDELT and Google Books (HTTP 429 on the first request), OpenAlex (its free budget is shared by everyone on your network and ran out at once), Europe PMC (14–31 seconds a search), Gutendex (25 seconds), Reddit and the Art Institute of Chicago (blocked), Open Food Facts (unavailable), TheMealDB (its free key is for development only).
 
@@ -198,7 +198,9 @@ Each result is three lines: title, link and details (e.g. votes and answers, sta
 
 ## Providers
 
-How providers differ is kept in one table in `teh.py`, `PROVIDER_QUIRKS`. Each entry is keyed by a fragment of the API URL and lists only what differs from the plain format. Every possible key is documented in `QUIRK_DEFAULTS`:
+The two API formats, Anthropic Messages and OpenAI chat completions, are each one class (`AnthropicFormat`, `OpenAIFormat`, in `FORMATS`). Each class builds the request, reads the reply into a `Reply`, writes tool definitions and results, and says where the effort level goes by default. To support another format, subclass `APIFormat` and add it to `FORMATS`.
+
+How providers differ within a format is kept in one table in `teh.py`, `PROVIDER_QUIRKS`. Each entry is keyed by a fragment of the API URL and lists only what differs from the plain format. Every possible key is documented in `QUIRK_DEFAULTS`:
 
 | Key | What it says |
 |---|---|
@@ -278,9 +280,10 @@ When a budget stops a turn, the commands that finished are kept in the conversat
 - **Shared** (top): the filter that makes text safe to show, and the decoding of command output and piped input.
 - **Part 1 · The harness:**
   - providers and their table (`PROVIDERS`, `PROVIDER_QUIRKS`)
-  - settings (`Config`, fixed for the session) and state (`State`, what changes during it)
+  - the settings table (`SETTINGS`: one row per `TEH_` variable, saying how it's read, which field it sets and its `--help` line; to add a setting, add a row and document it in the README)
+  - the session (`Session`): the settings (`Config`, fixed at startup), what was found and set up at startup (`Environment`: the shell, the scratch folder, the system prompt), what changes during the session (`State`: the model, effort, totals and budgets) and during one prompt (`TurnState`), and the conversation. There's no global state: every function that needs any of it is given the session
   - the environment: the shell, the scratch folder, the helpers' launchers (`HELPERS`), how PowerShell commands run (`POWERSHELL_RUN`), `AGENTS.md`, and the system prompt (`system_prompt()`)
-  - the model API
+  - the model API: one class per format (`FORMATS`), and `step()`, which makes one call and returns a `Reply` (text, reasoning, tool calls and `Usage`)
   - commands
   - the conversation loop, budgets and compaction
   - chat input, `main()`, the startup segment, and the chat commands (`CHAT_COMMANDS`: to add one, write a function and add it there)
@@ -292,7 +295,7 @@ Importing it has no side effects, so the unit tests can import it.
 
 ## Tests
 
-The tests use fake API servers on your machine (`tests/fakes/`): no API key, no network, no cost. `tests/` holds what every system shares: the unit tests (`test_units.py`, plain Python) and the fake servers. Each system's own suites, which drive `teh` through its shell and terminal, live in a folder of their own: `tests/unix/` (bash, and a pseudo-terminal for chat) and `tests/windows/` (Python only, running the model's commands in cmd, Windows PowerShell and PowerShell 7 where it's installed). See [`tests/README.md`](tests/README.md) for the layout. GitHub Actions runs both on every push and pull request, with Python 3.10, 3.12 and 3.14 (`.github/workflows/tests.yml`).
+The tests use fake API servers on your machine (`tests/fakes/`): no API key, no network, no cost. `tests/` holds the unit tests (`test_units.py`) and the fake servers, and `tests/e2e/` the suites that drive `teh` through its shells and terminal. All are plain Python, and the same suites run on every system: what differs between systems (the shells and their syntax, Ctrl+C, running without a terminal, listing processes) is kept in `tests/e2e/lib.py`, so each suite says what it checks once. They run the model's commands in bash and sh (and zsh where it's installed), or in cmd, Windows PowerShell and PowerShell 7 where it's installed. See [`tests/README.md`](tests/README.md) for the layout. GitHub Actions runs them on Linux and Windows on every push and pull request, with Python 3.10, 3.12 and 3.14 (`.github/workflows/tests.yml`).
 
 | Suite | What it covers |
 |---|---|
@@ -305,7 +308,7 @@ The tests use fake API servers on your machine (`tests/fakes/`): no API key, no 
 | `compact` | Automatic compaction when the window is full, `/compact` in chat, the summary request, kept requests, the transcript, failures |
 | `fetch` | The web helper, offline: text extraction, hidden-text removal, safety, JSON, word search, request options (headers, methods, bodies, API errors); search is covered by `units`, with canned API answers |
 
-**`--changed`** skips a suite when nothing it depends on has changed since it last passed. That's `teh.py` (all of it for `core` and `fetch`, which test the web helper too; for the others, everything before Part 2), the suite's test script, the fake servers it starts, and the shared helpers. Comments don't count, so a comment-only edit reruns nothing; an edit to the web helper reruns `core` and `fetch` only. The unit tests always run, as they take seconds, and a failing one is shown in full. Each pass is recorded in `tests/unix/.passed` or `tests/windows/.passed` (delete it to start over). The dependencies are listed in each folder's `inputs.py`; a missing one could let a breaking change skip a suite, so run everything before you finish.
+**`--changed`** skips a suite when nothing it depends on has changed since it last passed. That's `teh.py` (all of it for `core` and `fetch`, which test the web helper too; for the others, everything before Part 2), the suite's test script, the fake servers it starts, and the shared helpers. Comments don't count, so a comment-only edit reruns nothing; an edit to the web helper reruns `core` and `fetch` only. The unit tests always run, as they take seconds, and a failing one is shown in full. Each pass is recorded in `tests/e2e/.passed` (delete it to start over). The dependencies are listed in `tests/e2e/inputs.py`; a missing one could let a breaking change skip a suite, so run everything before you finish.
 
 The suites wait for each fake server to accept connections, and for each prompt in chat tests, rather than for fixed times; the waits that remain are the deliberate ones (command timeouts, `retry-after`, a slow server).
 

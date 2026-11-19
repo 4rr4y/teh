@@ -1,11 +1,15 @@
-# Port 8766, OpenAI format: logs the Authorization header to argv[1], replies 'ok'
-import json, http.server, sys
-class H(http.server.BaseHTTPRequestHandler):
+"""Port 8766, OpenAI format: logs the Authorization header to argv[1], and answers "ok"."""
+import sys
+
+from common import Handler, openai_reply, read_json, send_json, serve, text
+
+
+class H(Handler):
     def do_POST(self):
-        self.rfile.read(int(self.headers["content-length"]))
-        open(sys.argv[1], "a").write(f"auth={self.headers.get('authorization')}\n")
-        b = json.dumps({"model": "fake", "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 1}}).encode()
-        self.send_response(200); self.send_header("content-length", len(b)); self.end_headers(); self.wfile.write(b)
-    def log_message(self, *a): pass
-http.server.HTTPServer(("127.0.0.1", 8766), H).serve_forever()
+        """Log the key, answer "ok"."""
+        read_json(self)
+        with open(sys.argv[1], "a") as log:
+            log.write(f"auth={self.headers.get('authorization')}\n")
+        send_json(self, openai_reply(text("ok")))
+
+serve(8766, H)

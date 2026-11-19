@@ -14,7 +14,11 @@ Everything else costs what it did: cache reads for what was there before, cache 
 It measures cost only. Whether results suffer from compacting earlier needs real runs: run.py with
 --config compact64k TEH_CONTEXT_WINDOW=64000 and so on (see bench/README.md). Runs that compacted on their own are
 left out, as their traces don't show the uncompacted growth."""
-import argparse, json, math, sys
+import argparse
+import itertools
+import json
+import math
+import sys
 from pathlib import Path
 
 SUMMARY_OUT = 600     # tokens: the summary (at most about 400 words)
@@ -37,7 +41,7 @@ def cost_of(uncached, write, read, out, p):
 def replay(calls, threshold, reread, p):  # -> (cost, compactions); threshold None: as it happened
     base = calls[0]["in"]  # the system prompt, the tool and the task: what a compacted conversation starts from
     ctx, cost, compactions = base, cost_of(0, base, 0, calls[0]["out"], p), 0
-    for before, call in zip(calls, calls[1:]):
+    for before, call in itertools.pairwise(calls):
         growth = max(0, call["in"] - before["in"])
         if threshold and ctx + growth >= threshold:
             cost += cost_of(0, SUMMARY_REQUEST, ctx, SUMMARY_OUT, p)               # the summary call
@@ -72,8 +76,8 @@ def main():
     # How well the replay's cost model matches what the provider reported, uncompacted
     actual = sum(sum(cost_of(c["uncached"], c["write"], c["read"], c["out"], p) for c in calls) for _, calls in runs)
     modelled = sum(replay(calls, None, 0, p)[0] for _, calls in runs)
-    print(f"{len(runs)} runs; peak context: median {sorted(max(c['in'] for c in cs) for _, cs in runs)[len(runs) // 2]:,}"
-          f", largest {max(max(c['in'] for c in cs) for _, cs in runs):,} tokens")
+    peaks = sorted(max(c["in"] for c in cs) for _, cs in runs)
+    print(f"{len(runs)} runs; peak context: median {peaks[len(runs) // 2]:,}, largest {peaks[-1]:,} tokens")
     print(f"cost model check: replayed without compaction {modelled:,.0f}, as reported {actual:,.0f} "
           f"({modelled / actual - 1:+.1%}; the difference is cache misses the replay doesn't model)\n")
 

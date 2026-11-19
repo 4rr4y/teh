@@ -1,8 +1,8 @@
-"""Prompt caching tables: session ids, cache markers, long retention, where cache hits are read from. The Windows
-counterpart of tests/unix/test_caching.sh (its chat part, the startup line and /clear, is in test_chat.py).
+"""Prompt caching tables: session ids, cache markers, long retention, where cache hits are read from (the chat part,
+the startup line and /clear, is in test_chat.py).
 Provider behaviour is matched on a fragment of the API URL, so putting the fragment in the path of the fake server's
 URL (http://127.0.0.1:8781/api.openai.com/v1) makes it behave as that provider."""
-from lib import Suite, section
+from lib import DEFAULT_SHELL, Suite, section
 
 s = Suite()
 U = "http://127.0.0.1:8781"
@@ -10,9 +10,10 @@ LOG = s.w / "req.log"
 s.serve("caching_server.py", LOG)
 s.ready()
 
-def run(**env):  # -> (stderr, the logged requests, with header names lower-cased)
+def run(**env):
+    """Run teh once; return (its stderr, the logged requests, with header names lower-cased)."""
     LOG.write_text("")
-    r = s.teh("go", env=dict(TEH_AUTO=1, TEH_SHELL="cmd", **env))
+    r = s.teh("go", env={"TEH_AUTO": 1, "TEH_SHELL": DEFAULT_SHELL, **env})
     reqs = s.requests(LOG)
     for q in reqs:
         q["headers"] = {k.lower(): v for k, v in q["headers"].items()}
@@ -70,7 +71,9 @@ s.check("DeepSeek field (prompt_cache_hit_tokens)",
         "in 100 (77 cached)" in run(TEH_BASE_URL=f"{U}/usage-deepseek/v1", TEH_MODEL="m")[0])
 s.check("Fireworks response header",
         "in 100 (66 cached)" in run(TEH_BASE_URL=f"{U}/api.fireworks.ai/usage-header/v1", TEH_MODEL="m")[0])
-s.check("top-level cached_tokens (Kimi)", "in 100 (55 cached)" in run(TEH_BASE_URL=f"{U}/usage-top/v1", TEH_MODEL="m")[0])
-s.check("Anthropic usage", "in 100 (90 cached)" in run(TEH_BASE_URL=f"{U}/api.anthropic.com/v1", TEH_MODEL="claude-x")[0])
+s.check("top-level cached_tokens (Kimi)",
+        "in 100 (55 cached)" in run(TEH_BASE_URL=f"{U}/usage-top/v1", TEH_MODEL="m")[0])
+s.check("Anthropic usage",
+        "in 100 (90 cached)" in run(TEH_BASE_URL=f"{U}/api.anthropic.com/v1", TEH_MODEL="claude-x")[0])
 
 s.finish()

@@ -9,13 +9,26 @@ environment. Each --config is a name and the TEH_ settings it adds or changes, e
 --config compact20k TEH_CONTEXT_WINDOW=20000; without one, a single config, "baseline", runs teh as it is. A config
 may also name another copy of teh to run, HARNESS=path/to/teh.py, to compare two versions on the same day. Results go
 to bench/results/RUN/: results.jsonl (one line per run of a task), and for each run its log (teh's stderr) and trace
-(every model call, recorded by a proxy between teh and the API). A run already in results.jsonl is skipped, so an interrupted run can be resumed with the same --name.
+(every model call, recorded by a proxy between teh and the API). A run already in results.jsonl is skipped, so an
+interrupted run can be resumed with the same --name.
 
 Every model call goes through a small proxy on localhost, which passes it on unchanged and records its token usage:
 cache writes and reads included, which teh's own JSON summary doesn't separate.
 """
-import argparse, concurrent.futures, fnmatch, importlib.util, json, os, signal, subprocess, sys, tempfile
-import threading, time, urllib.error, urllib.request
+import argparse
+import concurrent.futures
+import fnmatch
+import importlib.util
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,7 +37,8 @@ BENCH = Path(__file__).resolve().parent
 HARNESS = BENCH.parent / "teh.py"
 TASKS = BENCH / "tasks"
 GUARDS = {"TEH_TURN_BUDGET": "80", "TEH_TOKEN_BUDGET": "4000000", "TEH_COMMAND_TIMEOUT": "120"}  # per run; a
-TIMEOUTS = {"short": 600, "slow": 900, "long": 1500, "xl": 2700}  # seconds for a whole run           # config can change them
+# Seconds for a whole run, by the task's size (config can change them)
+TIMEOUTS = {"short": 600, "slow": 900, "long": 1500, "xl": 2700}
 TURNS = {"xl": "150"}  # model calls, where the size needs more than the guard above
 
 def load_harness():  # teh.py as a module: it has no side effects on import
@@ -87,7 +101,8 @@ class Proxy(BaseHTTPRequestHandler):
                 status, data, reply_headers = r.status, r.read(), r.headers
         except urllib.error.HTTPError as e:
             status, data, reply_headers = e.code, e.read(), e.headers
-        except Exception as e:  # network: teh sees a 502 and retries as it would
+        # Any other failure (the network): teh sees a 502 and retries, as it would
+        except Exception as e:  # noqa: BLE001
             status, data, reply_headers = 502, json.dumps({"error": f"proxy: {e}"}).encode(), {}
         self.server.record(url, json.loads(body), status, data, reply_headers, time.monotonic() - start)
         self.send_response(status)
@@ -163,7 +178,8 @@ def run_one(task_name, task, config, overrides, rep, out, model_env, upstream):
     proxy.shutdown()
     try:
         passed, detail = task.check(work, result.get("answer") or "")
-    except Exception as e:  # a crash in the checker is a failed run, with the reason
+    # A crash in the checker, whatever it is, is a failed run, with the reason
+    except Exception as e:  # noqa: BLE001
         passed, detail = False, f"checker error: {type(e).__name__}: {e}"
     calls = [c for c in proxy.calls if "usage" in c]
     totals = {k: sum(c["usage"][k] for c in calls) for k in ("in", "uncached", "write", "read", "out")}
@@ -244,7 +260,8 @@ def main():
                 t, c, rep = futures[future]
                 try:
                     r = future.result()
-                except Exception as e:
+                # One run failing, however, mustn't stop the others
+                except Exception as e:  # noqa: BLE001
                     print(f"ERROR {c} {t} #{rep}: {type(e).__name__}: {e}", file=sys.stderr)
                     continue
                 with lock, open(results, "a") as f:

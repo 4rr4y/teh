@@ -1,18 +1,19 @@
-"""Runs the Windows test suites: python tests\\windows\\run.py [--changed] [suite ...]   e.g. run.py core fetch
+"""Runs the test suites: python tests/e2e/run.py [--changed] [suite ...]   e.g. run.py core fetch
   --changed  skips a suite when nothing it depends on has changed since it last passed (see inputs.py). The unit tests
              always run: they take a few seconds.
-Needs Windows and Python 3.10 or later, nothing else: no API key, no network. The suites run the model's commands in
-cmd and Windows PowerShell, and in PowerShell 7 (pwsh) too where it's installed."""
-import subprocess, sys
+Needs Python 3.10 or later, nothing else: no API key, no network. Runs on Linux, macOS and Windows; the suites run the
+model's commands in the system's shells (see SHELLS in lib.py)."""
+import subprocess
+import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SUITES = ["units", "core", "chat", "caching", "errors", "output", "compact", "fetch"]
-PASSED = HERE / ".passed"  # one line per suite: its name and the hash of its inputs when it last passed
+# One line per suite: its name and the hash of its inputs when it last passed
+PASSED = HERE / ".passed"
 
 def main(args):
-    if sys.platform != "win32":
-        sys.exit("the Windows suites need Windows: on Linux or macOS, run tests/unix/run.sh")
+    """Run the suites args names (all by default); return the exit code: 1 if any failed."""
     changed = args[:1] == ["--changed"]
     suites = args[1:] if changed else args
     suites = suites or SUITES
@@ -26,17 +27,19 @@ def main(args):
         if suite == "units":
             print("######## units", flush=True)
             p = subprocess.run([sys.executable, "-B", "-m", "unittest", "-q", "test_units"], cwd=HERE.parent,
-                               capture_output=True, text=True)  # shared with other systems
+                               capture_output=True, text=True, check=False)
             out = p.stdout + p.stderr
-            print("\n".join(out.strip().splitlines()[-3:]) if p.returncode == 0 else out, flush=True)  # a failure: all
+            # A failure is shown whole, to see which test and why
+            print("\n".join(out.strip().splitlines()[-3:]) if p.returncode == 0 else out, flush=True)
         else:
             key = digest(suite)
             if changed and passed.get(suite) == key:
                 skipped.append(suite)
                 continue
             print(f"######## {suite}", flush=True)
-            p = subprocess.run([sys.executable, "-B", str(HERE / f"test_{suite}.py")], cwd=HERE)
-            if p.returncode == 0:  # remember it passed with these inputs
+            p = subprocess.run([sys.executable, "-B", str(HERE / f"test_{suite}.py")], cwd=HERE, check=False)
+            # Remember it passed with these inputs
+            if p.returncode == 0:
                 passed[suite] = key
                 PASSED.write_text("".join(f"{k} {v}\n" for k, v in sorted(passed.items())))
         if p.returncode != 0:

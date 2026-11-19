@@ -4,9 +4,13 @@
 Cost is in input-token equivalents, so providers and configs can be compared on one number: uncached input counts 1,
 a cache write --write (default 1.25, as for Anthropic's 5-minute cache), a cache read --read (0.1) and output
 --output (5). Set them to your model's price ratios. For OpenAI-format providers, input that isn't cached counts 1."""
-import argparse, json, math, sys
+import argparse
+import json
+import math
+import sys
 from collections import defaultdict
 from pathlib import Path
+
 
 def load(dirs):
     runs = []
