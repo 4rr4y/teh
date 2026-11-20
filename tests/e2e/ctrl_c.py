@@ -1,4 +1,5 @@
-"""usage: ctrl_c.py SECONDS teh.py ARG ...: runs teh, presses Ctrl+C after SECONDS, prints teh's exit code.
+"""usage: ctrl_c.py SECONDS teh.py ARG ...: runs teh, presses Ctrl+C after SECONDS, prints teh's exit code and the
+seconds it took to exit after the press.
 
 Windows has no SIGINT to send to one process: Ctrl+C is an event for every process attached to a console. So this
 script is started in a console of its own (lib.py: Suite.ctrl_c), runs teh in it, and sends the event to that whole
@@ -14,9 +15,10 @@ signal.signal(signal.SIGINT, signal.SIG_IGN)               # but this script its
 p = subprocess.Popen([sys.executable, "-B", *sys.argv[2:]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(float(sys.argv[1]))
 ctypes.windll.kernel32.GenerateConsoleCtrlEvent(0, 0)  # CTRL_C_EVENT, to every process on this console
+pressed = time.monotonic()
 try:
     code = p.wait(timeout=20)
 except subprocess.TimeoutExpired:
     p.kill()
     code = "hung"
-print(code, flush=True)
+print(code, f"{time.monotonic() - pressed:.2f}", flush=True)

@@ -5,6 +5,7 @@
 r"""
 usage:  TEH_BASE_URL=<url|provider> TEH_API_KEY=<key> TEH_MODEL=<id> [TEH_EFFORT=<level>] python3 teh.py ["task"]
         with a task (or piped input) it runs once and exits; the answer goes to stdout, everything else to stderr
+        python3 teh.py --help | --version
 options:   (generated from the SETTINGS table: one line for each setting it lists)
 exit codes (one-shot): 0 done · 1 error · 2 refused · 3 context window full
                        4 reply cut off · 5 budget reached ·  130 cancelled
@@ -17,7 +18,7 @@ commands:  /budget [tokens N | calls N | off]
            /quit
            /undo
 keys:      Ctrl+C cancels the current turn   Ctrl+D exits (on Windows: Ctrl+Z, then Enter)
-           paste several lines at once, or end a line with \ to continue on the next"""
+           paste several lines at once, or end a line with a space and \ to continue on the next"""
 from __future__ import annotations
 
 import atexit
@@ -26,6 +27,7 @@ import codecs
 import contextlib
 import dataclasses
 import difflib
+import errno
 import html.parser
 import http.client
 import ipaddress
@@ -37,6 +39,7 @@ import re
 import select
 import shutil
 import signal
+import ssl
 import string
 import subprocess
 import sys
@@ -54,7 +57,7 @@ from types import MappingProxyType
 from xml.etree import ElementTree
 
 # Sent in the user agents: the harness's, and the web helper's to sites that ask who calls
-__version__ = "0.1"
+__version__ = "0.1.1"
 
 with contextlib.suppress(ImportError):
     # Arrow keys, history and multi-line paste at the prompt (not on Windows)
@@ -648,11 +651,17 @@ def read_agents_md(cfg, env):
     if not files:
         env.agents_info = "none found" if cfg.agents_md else "off (TEH_AGENTS_MD=0)"
         return ""
+    # One that can't be read (no permission) is left out, and the agents line says why
+    texts, infos = {}, {}
+    for path in files:
+        try:
+            texts[path] = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            infos[path] = f"{path} (left out: it can't be read, {e.strerror or e})"
     # The budget goes to the closest file first, the most specific ("the closest AGENTS.md wins"); a file that
     # doesn't fit is cut at a line break, and any beyond it, nearer the root, are left out with a note
-    budget, parts, infos = AGENTS_MD_MAX, {}, {}
-    for path in reversed(files):
-        text = path.read_text(encoding="utf-8", errors="replace")
+    budget, parts = AGENTS_MD_MAX, {}
+    for path, text in reversed(texts.items()):
         size = f"{path} ({len(text):,} characters"
         if len(text) <= budget:
             parts[path], infos[path] = text, f"{size}, added to the system prompt)"
@@ -668,8 +677,8 @@ def read_agents_md(cfg, env):
             parts[path] = f"[Not included, over the {AGENTS_MD_MAX:,}-character limit: read it when it's relevant]"
             infos[path], env.agents_cut = f"{size}, left out: over the {AGENTS_MD_MAX:,} limit)", True
         budget -= len(text)
-    env.agents_used, env.agents_info = True, "; ".join(infos[path] for path in files)
-    return "".join(f"\n\nProject instructions from {path}:\n\n{parts[path]}" for path in files)
+    env.agents_used, env.agents_info = bool(parts), "; ".join(infos[path] for path in files)
+    return "".join(f"\n\nProject instructions from {path}:\n\n{parts[path]}" for path in files if path in parts)
 
 def setup_environment(cfg, environ):
     """Find the shell, create the scratch folder, and write the system prompt; return the Environment."""
@@ -813,15 +822,16 @@ def warn(s):
     print(f"\033[1;33m{s}\033[0m" if COLOR else s, file=sys.stderr)
 
 @contextlib.contextmanager
-def thinking():
-    """Show a live "thinking… 3s" line while waiting for the model; it's erased when the reply arrives."""
+def thinking(label="thinking"):
+    """Show a live "thinking… 3s" line while waiting for the model (or label's "… 3s" for another wait); it's erased
+    when the wait ends."""
     done, start = threading.Event(), time.monotonic()
 
     def tick():
         """Redraw the line every second, from the first: fast replies don't flicker."""
         while not done.wait(1):
             seconds = time.monotonic() - start
-            print(f"\r\033[2m· thinking… {seconds:.0f}s\033[0m", end="", file=sys.stderr, flush=True)
+            print(f"\r\033[2m· {label}… {seconds:.0f}s\033[0m", end="", file=sys.stderr, flush=True)
 
     timer = threading.Thread(target=tick, daemon=True)
     if COLOR:
@@ -872,6 +882,52 @@ def retry_after(headers):
             return min(float(headers.get(name)) / scale, 60)
     return None
 
+def interruptible(work):
+    """Return work(), run in a thread of its own, so Ctrl+C stops the wait at once on every system.
+
+    On Windows, Ctrl+C can't interrupt a blocking network read: it would act only once the reply came, and a second
+    press, made because the first seemed ignored, would then land at the chat prompt and end the chat. Here the main
+    thread waits in short steps, between which Ctrl+C acts. A cancelled request finishes (or times out) in the
+    background, and its result is dropped.
+    """
+    result = {}
+
+    def run():
+        """Do the work, keeping what it returns or raises."""
+        try:
+            result["value"] = work()
+        except BaseException as e:  # noqa: BLE001 - raised again in the waiting thread
+            result["error"] = e
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    while worker.is_alive():
+        worker.join(0.1)
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+def fetch_reply(req, timeout):
+    """Send req and return (the reply's body, its headers); urllib's errors as it raises them."""
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(), resp.headers
+
+def certificate_failed(error):
+    """Whether a connection failed because the server's certificate couldn't be verified: retrying can't help."""
+    return isinstance(getattr(error, "reason", error), ssl.SSLCertVerificationError)
+
+def network_problem(error):
+    """Describe a failed connection for the user: for a certificate that couldn't be verified, how to fix it."""
+    reason = getattr(error, "reason", error)
+    if not certificate_failed(error):
+        return f"network error: {reason}"
+    # python.org's Python for macOS has no certificates of its own until its Install Certificates script is run
+    fix = (f'run "Install Certificates.command" in /Applications/Python {sys.version_info.major}.'
+           f"{sys.version_info.minor} (python.org's Python for macOS doesn't use the system's certificates)"
+           if sys.platform == "darwin" else
+           "install the system's CA certificates, or set SSL_CERT_FILE to a certificate bundle")
+    return f"Python couldn't verify the server's certificate ({reason.verify_message}): {fix}"
+
 def post(session, path, body):
     """POST body as JSON to the API path and return the JSON reply; APIError when it fails for good.
 
@@ -884,8 +940,8 @@ def post(session, path, body):
         # Wait 2, 4, then 8s, unless the provider says how long
         delay = 2 ** (attempt + 1)
         try:
-            with thinking(), urllib.request.urlopen(req, timeout=600) as resp:
-                data, headers = resp.read(), resp.headers
+            with thinking():
+                data, headers = interruptible(lambda: fetch_reply(req, 600))
         except urllib.error.HTTPError as e:
             # Timeouts, rate limits and server errors are worth retrying; the rest fail with the provider's message
             if e.code not in (408, 429, 500, 502, 503, 504, 529) or attempt == 3:
@@ -893,8 +949,9 @@ def post(session, path, body):
             why, delay = f"HTTP {e.code}", retry_after(e.headers) or delay
         # HTTPException: the connection broke off mid-reply (IncompleteRead, RemoteDisconnected)
         except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as e:
-            if attempt == 3:
-                raise APIError(f"network error: {e}") from None
+            # A certificate that can't be verified won't verify on a retry either
+            if attempt == 3 or certificate_failed(e):
+                raise APIError(network_problem(e)) from None
             why = "network error"
         else:
             return read_reply(cfg, data, headers)
@@ -1493,7 +1550,8 @@ def turn(session, user):
                 dim(f"\n{safe(reasoning[:cfg.thinking])}{'…' if len(reasoning) > cfg.thinking else ''}")
             if text:
                 state.turn.answer = text
-                if cfg.output != "json":
+                # TEH_OUTPUT=json is for one-shot runs, whose JSON has the answer: a chat always shows its replies
+                if not (state.one_shot and cfg.output == "json"):
                     print(f"\n{safe(text)}", file=sys.stderr if state.one_shot else sys.stdout)
             status(session, time.monotonic() - start, reply.usage)
             # Don't run commands from a cut-off reply: they may be incomplete. Still answer each call, so the history
@@ -1548,6 +1606,12 @@ Decisions: what was decided and why, including dead ends (one line each).
 Next: the next step.
 Leave out anything that can be read again from disk, such as code and file contents."""
 
+def call_command(args):
+    """Return a tool call's command for the transcript, or what stands in for a call without one (cut off by
+    max_tokens, or malformed): such a call wasn't run."""
+    command = args.get("command")
+    return command if isinstance(command, str) else "(no command: not run)"
+
 def transcript(msgs):
     """Return the conversation as plain text: prompts, replies, commands and their output (either API format)."""
     out = []
@@ -1564,8 +1628,8 @@ def transcript(msgs):
             # Anthropic content blocks, or OpenAI text (made a block) with its tool calls apart
             blocks = content if isinstance(content, list) else [{"type": "text", "text": content or ""}]
             out += [f"## assistant\n{b['text']}" for b in blocks if b.get("type") == "text" and b["text"].strip()]
-            out += [f"## command\n{b['input'].get('command')}" for b in blocks if b.get("type") == "tool_use"]
-            out += [f"## command\n{parse_args(c['function']['arguments']).get('command')}"
+            out += [f"## command\n{call_command(b['input'])}" for b in blocks if b.get("type") == "tool_use"]
+            out += [f"## command\n{call_command(parse_args(c['function']['arguments']))}"
                     for c in m.get("tool_calls") or []]
     return "\n\n".join(out) + "\n"
 
@@ -1617,14 +1681,27 @@ def pasted_more():
         return msvcrt.kbhit()
     return bool(select.select([sys.stdin], [], [], 0.03)[0])
 
+def continues(line):
+    r"""Whether a typed line asks to go on to the next: it ends in a space and \, or is only \.
+
+    Not a \ right after text, which ends a Windows path (C:\Users\me\) as often as anything.
+    """
+    return line.endswith((" \\", "\t\\")) or line == "\\"
+
 def read_prompt():
-    r"""Read one prompt: a pasted block is one prompt, not one per line; a line ending in \ continues on the next."""
+    r"""Read one prompt: a pasted block is one prompt, not one per line; a typed line ending in " \" continues on the
+    next (see continues)."""
     # With readline 8.1+, a pasted block often arrives here already whole
     lines = [input("\n> ")]
-    while lines[-1].endswith("\\") or pasted_more():
-        lines[-1] = lines[-1].removesuffix("\\")
-        lines.append(input("… "))
-    return "\n".join(lines).strip()
+    while True:
+        # More of a paste: its lines are kept as they are, a \ at the end included
+        if pasted_more():
+            lines.append(input("… "))
+        elif continues(lines[-1]):
+            lines[-1] = lines[-1][:-1]
+            lines.append(input("… "))
+        else:
+            return "\n".join(lines).strip()
 
 def piped_input(session):
     """Read stdin, for the prompt: tidied like command output, any bytes accepted (a log may have stray ones)."""
@@ -1644,6 +1721,9 @@ def main():
     # Only as the first argument: a task may contain -h (teh explain ls -h)
     if sys.argv[1:2] in (["-h"], ["--help"]):
         raise SystemExit(USAGE)
+    if sys.argv[1:2] == ["--version"]:
+        print(f"teh {__version__}")
+        return 0
     check_names(os.environ)
     session = start_session(os.environ)
     cfg, env, state = session.cfg, session.env, session.state
@@ -1687,12 +1767,17 @@ def main():
         elif re.fullmatch(r"/[a-z]+", command):
             print(f"unknown command {command}: /help lists them")
         elif user:
-            turn(session, user)
+            # A second Ctrl+C while a cancelled turn is tidied up: the turn is cancelled already, the chat goes on
+            with contextlib.suppress(KeyboardInterrupt):
+                turn(session, user)
 
 def run_chat_command(session, command, arg):
-    """Run a chat command. A bug in it is reported with its traceback, and the chat goes on."""
+    """Run a chat command. Ctrl+C cancels it, and a bug in it is reported with its traceback; the chat goes on."""
     try:
         CHAT_COMMANDS[command](session, arg)
+    # Ctrl+C while it waits (/model fetching the model list): the command is cancelled, not the chat
+    except KeyboardInterrupt:
+        print(f"\n[cancelled] {command}", file=sys.stderr)
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         print(f"[error] a bug in teh, in {command}: {e!r}", file=sys.stderr)
@@ -1752,25 +1837,40 @@ def model_window(entry):
             return value
     return None
 
+class NoModelList(TehError):
+    """The provider's model list couldn't be had; the message says why."""
+
 def available_models(session):
-    """Return {model id: its context window, or None} for the models the provider lists, or None when it can't say
-    (no list, an error)."""
+    """Return {model id: its context window, or None} for the models the provider lists; NoModelList, saying why,
+    when there's no list or it couldn't be read."""
     cfg = session.cfg
     url, models = cfg.base + "/models" + cfg.api.models_query, {}
     headers = {k: v for k, v in cfg.headers.items() if k != "content-type"}
     try:
         while url:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=15) as resp:
-                page = json.load(resp)
+            # A long list, or a slow provider, can take seconds: a timer shows it's working
+            req = urllib.request.Request(url, headers=headers)
+            with thinking("listing models"):
+                body, _ = interruptible(lambda req=req: fetch_reply(req, 15))
+            page = json.loads(body)
             models |= {plain_id(m["id"]): model_window(m) for m in page.get("data") or []
                        if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]}
             # Anthropic pages its list: the next page starts after the last id
             more = page.get("has_more") and page.get("last_id")
             url = more and f"{cfg.base}/models?limit=1000&after_id={urllib.parse.quote(more)}"
-    except (OSError, ValueError, AttributeError):
-        # OSError covers HTTP and network errors; ValueError, bad JSON; AttributeError, JSON that isn't an object
-        return None
-    return models or None
+    except urllib.error.HTTPError as e:
+        # Not found or not allowed: no list here, the usual case for a server without one
+        raise NoModelList("the provider doesn't list its models" if e.code in (404, 405, 501) else
+                          f"the provider's model list answered HTTP {e.code}") from None
+    # The connection failed, or broke off mid-reply
+    except (OSError, http.client.HTTPException) as e:
+        raise NoModelList(f"the model list couldn't be fetched: {network_problem(e)}") from None
+    # ValueError: bad JSON; AttributeError: JSON that isn't an object
+    except (ValueError, AttributeError):
+        raise NoModelList("the provider's model list isn't in a form teh can read") from None
+    if not models:
+        raise NoModelList("the provider's model list is empty")
+    return models
 
 def plain_id(listed_id):
     """Return a listed model id as the provider takes it in a request.
@@ -1793,14 +1893,17 @@ def pick_model(session, query, listed):
     with their context windows, and return the one the user picks, or None."""
     cfg = session.cfg
     matches = sorted(name for name in listed if query.lower() in name.lower())
-    count = f"{len(listed):,} model{'s' * (len(listed) != 1)} {cfg.base} lists"
-    if matches:
-        print(f"{len(matches):,} of the {count}" + (f" contain {query!r}" if query else "") + ":")
+    # e.g. "https://openrouter.ai/api/v1 lists 2 models; 1 contains 'flash':"
+    lists = f"{cfg.base} lists {len(listed):,} model{'s' * (len(listed) != 1)}"
+    if not query:
+        print(f"{lists}:")
+    elif matches:
+        print(f"{lists}; {len(matches):,} contain{'s' * (len(matches) == 1)} {query!r}:")
     elif close := difflib.get_close_matches(query, listed, n=5):
-        print(f"none of the {count} contains {query!r}; the closest:")
+        print(f"{lists}; none contains {query!r}, the closest:")
         matches = close
     else:
-        print(f"none of the {count} contains {query!r}, or is close to it")
+        print(f"{lists}; none contains {query!r}, or is close to it")
         return None
     shown = matches[:PICKER_MAX]
     width = max(len(name) for name in shown)
@@ -1838,14 +1941,18 @@ def chat_model(session, arg):
     """/model [id or part of one]: another model from the next call on, with its context window.
 
     An id the provider lists switches at once; part of one, or nothing, lists the models that match to pick from.
-    Without a list from the provider, an id switches unchecked, and nothing shows the status line. A model whose
-    window the conversation doesn't fit is refused: compacting it would need the new model to read it all.
+    Without a list from the provider, it says why, and an id switches unchecked. A model whose window the conversation
+    doesn't fit is refused: compacting it would need the new model to read it all.
     """
     state, msgs = session.state, session.msgs
     query = arg.strip()
-    listed = available_models(session)
+    try:
+        listed, why_unlisted = available_models(session), ""
+    except NoModelList as e:
+        listed, why_unlisted = None, str(e)
     if listed is None:
         if not query or query == state.model:
+            dim(f"· couldn't list the models: {why_unlisted}")
             show_status(session)
             return
         model, window = query, None
@@ -1865,8 +1972,7 @@ def chat_model(session, arg):
     if model != state.model:
         state.model, state.summarize = model, wants_summary(model, session.cfg.fmt, session.cfg.thinking)
         if listed is None:
-            dim("· couldn't check the model: the provider doesn't list its models, so an unknown one fails at the "
-                "next call")
+            dim(f"· couldn't check the model: {why_unlisted}. An unknown one fails at the next call")
         # Each model has its own prompt cache
         if msgs:
             dim("· the prompt cache is per model: the next call reads the conversation at full price")
@@ -1938,8 +2044,8 @@ CHAT_COMMANDS = {"/model": chat_model, "/effort": chat_effort, "/budget": chat_b
 # so little ends up in the model's conversation (which is resent on every call). The harness tells the model to use
 # it for all web access, through the shell tool, so the model still has a single tool. Uses only the standard library.
 FETCH_USAGE = """usage: teh.py --fetch [OPTION ...] URL [WORD ...]
-  With WORDs: prints the lines containing any of them, numbered, with a little context (quote a phrase to search for
-  it as one). Without: prints the start of the page.
+  URL starts with http:// or https://. With WORDs: prints the lines containing any of them, numbered, with a
+  little context (quote a phrase to search for it as one). Without: prints the start of the page.
   Either way the full text is saved (in $TEH_SCRATCH, else a teh-fetch folder in the temp folder), so more can be read
   with grep or sed without fetching again.
 options (anywhere on the line; the names are curl's, which models know, but curl is not used):
@@ -2193,7 +2299,10 @@ def request_options(args):
     # As curl's --json does; a header given with -H still wins
     if as_json:
         headers = {"content-type": "application/json", "accept": "application/json", **headers}
-    url = rest[0] if "://" in rest[0] else "https://" + rest[0]
+    # Never guessed: a local server usually serves http://, a public one https://
+    url = rest[0]
+    if not url.lower().startswith(("http://", "https://")):
+        raise SystemExit(f"the URL must start with http:// or https://, not {url!r}")
     return WebRequest(url, rest[1:], method, headers, b"&".join(data) if data else None)
 
 def error_text(error):
@@ -2287,8 +2396,12 @@ def web_folder():
 
 def save_page(url, text):
     """Save a page's full text, for grep or sed without fetching again; return its path."""
-    # Named after the URL: its runs of other characters become "-"
-    saved = web_folder() / (re.sub(r"\W+", "-", url.split("://")[-1]).strip("-")[:80] + ".txt")
+    # Named after the URL: its runs of other characters become "-". A long name is cut, and ends in a hash of the
+    # whole URL, so URLs that differ only past the cut (?page=1, ?page=2) get files of their own
+    name = re.sub(r"\W+", "-", url.split("://")[-1]).strip("-")
+    if len(name) > 80:
+        name = f"{name[:71]}-{zlib.crc32(url.encode()):08x}"
+    saved = web_folder() / (name + ".txt")
     saved.write_text(text, encoding="utf-8")
     return saved
 
@@ -2314,6 +2427,8 @@ def fetch_main(args):
         if request.plain and getattr(error, "code", None) in (401, 403, 429):
             raise SystemExit(f"fetch failed: {url} refuses automated requests (HTTP {error.code}). Try the site's API "
                              "or RSS feed, or another source for the same information")
+        if certificate_failed(error):
+            raise SystemExit(f"fetch failed: {network_problem(error)}")
         raise SystemExit(f"fetch failed: {error}{error_text(error)}")
 
     if "html" in kind:
@@ -2565,6 +2680,8 @@ def search_main(args):
         if getattr(e, "code", None) in (403, 429, 503):
             raise SystemExit(f"search failed: {name} refused the request (HTTP {e.code}). Its limit: {source.limits}."
                              " Wait, or search another source") from None
+        if certificate_failed(e):
+            raise SystemExit(f"search failed: {name}: {network_problem(e)}") from None
         raise SystemExit(f"search failed: {name}: {e}{error_text(e)}") from None
 
     lines = []
@@ -2802,4 +2919,16 @@ if __name__ == "__main__":
     # The helpers' roles (see HELPERS); with no role argument, teh runs as the harness
     ROLES = {"--fetch": fetch_main, "--edit": edit_main}
     role = ROLES.get(sys.argv[1] if len(sys.argv) > 1 else "")
-    sys.exit(role(sys.argv[2:]) if role else main())
+    try:
+        code = role(sys.argv[2:]) if role else main()
+        # Inside the try: a pipe that closed is found when the output is flushed, at the latest
+        sys.stdout.flush()
+    # What reads the output stopped reading (teh "…" | head): there's nothing more to say, and Python would print a
+    # traceback, and complain again at exit. Windows reports a closed pipe as EINVAL. 141 is the exit code of a
+    # program stopped by a closed pipe
+    except OSError as e:
+        if not (isinstance(e, BrokenPipeError) or (os.name == "nt" and e.errno == errno.EINVAL)):
+            raise
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        code = 141
+    sys.exit(code)

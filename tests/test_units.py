@@ -372,6 +372,21 @@ class Harness(unittest.TestCase):
             self.assertEqual(h.step(session, msgs).text, "")
             self.assertEqual(msgs, [{"role": "user", "content": "hi"}])
 
+    def test_teh_output_json_leaves_chat_replies_shown(self):  # it's for one-shot runs, whose JSON has the answer
+        import contextlib
+        import io
+        self.addCleanup(setattr, h, "post", h.post)
+        h.post = lambda session, path, body: {"content": [{"type": "text", "text": "the reply"}],
+                                              "stop_reason": "end_turn", "usage": {}}
+        for one_shot, shown in ((False, True), (True, False)):
+            configure(TEH_OUTPUT="json")
+            session.state.one_shot = one_shot
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(h.turn(session, "hi"), "done")
+            self.assertEqual("the reply" in out.getvalue() + err.getvalue(), shown, one_shot)
+            self.assertEqual(session.state.turn.answer, "the reply")  # for the JSON either way
+
     def test_a_cut_off_replys_arguments_are_kept_as_empty_json(self):  # cut-off JSON: a strict server rejects it
         reply = {"choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": None,
                  "tool_calls": [{"id": "c1", "type": "function",
@@ -390,6 +405,20 @@ class Harness(unittest.TestCase):
         h.step(session, msgs)
         self.assertEqual(msgs[1]["tool_calls"][0]["function"]["arguments"], '{"command": "ls"}')
 
+    def test_a_typed_backslash_continues_only_after_a_space(self):  # C:\\Users\\me\\ is a path, not "go on"
+        from unittest import mock
+        def read(typed, pasted=()):  # -> the prompt read from these lines; pasted: how many arrive as one paste
+            answers, waiting = iter(typed), list(pasted)
+            with mock.patch("builtins.input", lambda prompt="": next(answers)), \
+                    mock.patch.object(h, "pasted_more", lambda: bool(waiting) and waiting.pop(0)):
+                return h.read_prompt()
+        self.assertEqual(read(["list C:\\Users\\me\\"]), "list C:\\Users\\me\\")
+        self.assertEqual(read(["first \\", "second"]), "first \nsecond")
+        self.assertEqual(read(["\\", "next"]), "\nnext".strip())  # a lone \\ continues
+        # Pasted lines keep a \\ at their end: a Windows path, or a shell line continued
+        self.assertEqual(read(["dir C:\\temp\\", "make \\", "  all"], pasted=[True, True, False]),
+                         "dir C:\\temp\\\nmake \\\n  all")
+
     def test_piped_input(self):
         import io
         import tempfile
@@ -404,6 +433,55 @@ class Harness(unittest.TestCase):
         text = h.piped_input(session)
         self.assertTrue(text.startswith("line 0\n") and text.endswith("line 99") and "full output in" in text)
         self.assertLess(len(text), 400)
+
+class CommandLine(unittest.TestCase):  # teh.py run as a program: its flags, and its output into a pipe
+    def run_teh(self, *args, **env):  # -> the finished process (stdout, stderr as text)
+        import subprocess
+        return subprocess.run([sys.executable, "-B", h.__file__, *args], capture_output=True, text=True, timeout=60,
+                              stdin=subprocess.DEVNULL, env={**os.environ, **env}, check=False)
+
+    def test_version(self):  # only as the first argument: a task may mention it
+        r = self.run_teh("--version")
+        self.assertEqual((r.returncode, r.stdout), (0, f"teh {h.__version__}\n"))
+
+    def test_a_pipe_that_closes_early_is_no_error(self):  # teh "…" | head: no traceback
+        import http.server
+        import json
+        import subprocess
+        import threading
+        answer = "\n".join(f"line {i}" for i in range(200_000))  # far more than a pipe holds
+
+        class Provider(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["content-length"]))
+                body = json.dumps({"choices": [{"message": {"role": "assistant", "content": answer},
+                                                "finish_reason": "stop"}], "usage": {}}).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        env = {**os.environ, "TEH_BASE_URL": f"http://127.0.0.1:{server.server_port}", "TEH_MODEL": "m"}
+        import tempfile
+        # stderr to a file: a one-shot run shows its replies there too, and a full pipe nobody reads would block it
+        with tempfile.TemporaryFile() as stderr:
+            p = subprocess.Popen([sys.executable, "-B", h.__file__, "count"], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=stderr, env=env)
+            self.assertEqual(p.stdout.readline().strip(), b"line 0")
+            p.stdout.close()  # as head does, once it has its line
+            code = p.wait(timeout=60)
+            stderr.seek(0)
+            err = stderr.read().decode(errors="replace")
+        self.assertEqual(code, 141, err[-2000:])
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("Exception ignored", err)
 
 class AgentsMd(unittest.TestCase):  # AGENTS.md from the project root down to the working directory
     def tree(self, files, markers=()):  # a folder tree to work in -> its path; files: {relative path: text}
@@ -433,6 +511,24 @@ class AgentsMd(unittest.TestCase):  # AGENTS.md from the project root down to th
                 self.assertLess(text.index("ROOT"), text.index("CLOSEST"))  # the closest reads last: most specific
                 self.assertNotIn("above", text)                               # nothing above the project root
                 self.assertIn(f"Project instructions from {top / 'repo/a/b/AGENTS.md'}:", text)
+
+    def test_one_that_cant_be_read_is_left_out(self):  # no permission: said on the agents line, no crash
+        from unittest import mock
+        top = self.tree({"repo/AGENTS.md": "ROOT", "repo/a/AGENTS.md": "CLOSEST"}, ["repo/.git"])
+        locked, read_text = (top / "repo/AGENTS.md").resolve(), Path.read_text
+        def read(path, *args, **kwargs):
+            if path.resolve() == locked:
+                raise PermissionError(13, "Permission denied")
+            return read_text(path, *args, **kwargs)
+        with mock.patch.object(Path, "read_text", read):
+            text = self.read(top / "repo/a")
+        self.assertIn("CLOSEST", text)
+        self.assertNotIn("ROOT", text)
+        self.assertIn(f"{locked} (left out: it can't be read, Permission denied)", session.env.agents_info)
+        self.assertTrue(session.env.agents_used)
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "Permission denied")):
+            self.assertEqual(self.read(top / "repo/a"), "")  # none readable: none used
+        self.assertFalse(session.env.agents_used)
 
     def test_git_as_a_file(self):  # worktrees and submodules have a .git file
         top = self.tree({"repo/.git": "gitdir: elsewhere", "repo/AGENTS.md": "ROOT", "repo/sub/x": ""})
@@ -663,7 +759,11 @@ class ModelAndEffort(unittest.TestCase):  # /model and /effort: switched mid-cha
 
     def list_models(self, models):  # /model sees these as the provider's list ({id: context window or None})
         self.addCleanup(setattr, h, "available_models", h.available_models)
-        h.available_models = lambda session: models
+        def available_models(session):
+            if models is None:  # no list: why, as available_models says it
+                raise h.NoModelList("the provider doesn't list its models")
+            return models
+        h.available_models = available_models
 
     def test_model_switch(self):
         configure(TEH_THINKING="500")
@@ -682,17 +782,19 @@ class ModelAndEffort(unittest.TestCase):  # /model and /effort: switched mid-cha
                           "gpt-x": None})
         # Part of an id: the models containing it, numbered, with their windows; the number picks one
         out, err = self.run_command("/model", "SONNET", typed=["1"])
-        self.assertIn("1 of the 4 models https://api.anthropic.com/v1 lists contain 'SONNET':\n"
+        self.assertIn("https://api.anthropic.com/v1 lists 4 models; 1 contains 'SONNET':\n"
                       "   1. claude-sonnet-5-5  1,000,000 context\npick a number (Enter to cancel): ", out)
         self.assertEqual(session.state.model, "claude-sonnet-5-5")
         # Nothing: all of them, sorted; a window the list doesn't give shows as ?
         out, _ = self.run_command("/model", "", typed=["4"])
-        self.assertIn("4 of the 4 models", out)
+        self.assertIn("https://api.anthropic.com/v1 lists 4 models:\n", out)
         self.assertRegex(out, r"1\. claude-haiku-4-5 +200,000 context\n.*\n.*\n +4\. gpt-x +\? context\n")
         self.assertEqual(session.state.model, "gpt-x")
+        out, _ = self.run_command("/model", "claude")  # several: "contain"
+        self.assertIn("https://api.anthropic.com/v1 lists 4 models; 3 contain 'claude':\n", out)
         # A typo: none contains it, so the closest
         out, _ = self.run_command("/model", "claude-sonet-5-5", typed=["1"])
-        self.assertIn("none of the 4 models https://api.anthropic.com/v1 lists contains 'claude-sonet-5-5'; the "
+        self.assertIn("https://api.anthropic.com/v1 lists 4 models; none contains 'claude-sonet-5-5', the "
                       "closest:\n   1. claude-sonnet-5-5", out)
         self.assertEqual(session.state.model, "claude-sonnet-5-5")
         # Enter, Ctrl+D or a wrong number: nothing changes, and no status line
@@ -701,7 +803,7 @@ class ModelAndEffort(unittest.TestCase):  # /model and /effort: switched mid-cha
             self.assertEqual((session.state.model, err), ("claude-sonnet-5-5", ""))
         self.assertIn("not a number from 1 to 3: nothing changed", out)
         out, err = self.run_command("/model", "zzzz")
-        self.assertIn("none of the 4 models https://api.anthropic.com/v1 lists contains 'zzzz', or is close to it", out)
+        self.assertIn("https://api.anthropic.com/v1 lists 4 models; none contains 'zzzz', or is close to it", out)
         self.assertEqual(err, "")
 
     def test_model_picker_lists_at_most_picker_max(self):
@@ -768,14 +870,16 @@ class ModelAndEffort(unittest.TestCase):  # /model and /effort: switched mid-cha
         self.assertEqual(session.state.model, "my-local-model")
         self.assertIn("· couldn't check the model: the provider doesn't list its models", err)
         self.assertEqual(session.state.context_window, 262_144)
-        out, err = self.run_command("/model", "")  # nothing to pick from: the status line
+        out, err = self.run_command("/model", "")  # nothing to pick from: why, and the status line
         self.assertEqual(out, "")
-        self.assertIn("· anthropic · my-local-model", err)
+        self.assertIn("· couldn't list the models: the provider doesn't list its models\n· anthropic · my-local-model",
+                      err)
         h.available_models = lambda session: {"models/gemini-x": None}  # Gemini lists ids as models/<id>
         self.run_command("/model", "gemini-x")
         self.assertEqual(session.state.model, "gemini-x")
 
     def test_available_models_reads_both_formats_and_anthropics_pages(self):
+        import io
         import json
         import urllib.error
         import urllib.request
@@ -787,7 +891,7 @@ class ModelAndEffort(unittest.TestCase):  # /model and /effort: switched mid-cha
 
         class Reply:
             def __init__(self, body):
-                self.body = body
+                self.body, self.headers = body, {}
             def __enter__(self):
                 return self
             def __exit__(self, *a):
@@ -799,14 +903,30 @@ class ModelAndEffort(unittest.TestCase):  # /model and /effort: switched mid-cha
             seen.append(req.headers)
             if req.full_url not in pages:
                 raise urllib.error.URLError("not found")
+            if isinstance(pages[req.full_url], Exception):  # how the request fails
+                raise pages[req.full_url]
             return Reply(pages[req.full_url])
         self.addCleanup(setattr, urllib.request, "urlopen", urllib.request.urlopen)
         urllib.request.urlopen = urlopen
         configure(TEH_API_KEY="k")
         self.assertEqual(h.available_models(session), {"a": None, "b": None})
         self.assertEqual(seen[0].get("X-api-key"), "k")  # the provider's own auth header
-        configure(TEH_BASE_URL="https://example.test/v1")  # no list there: can't say
-        self.assertIsNone(h.available_models(session))
+        # No list, or none to be had: why, for /model to say
+        configure(TEH_BASE_URL="https://example.test/v1")
+        with self.assertRaisesRegex(h.NoModelList, "^the model list couldn't be fetched: network error: not found$"):
+            h.available_models(session)
+        url = "https://example.test/v1/models"
+        for code, why in [(404, "the provider doesn't list its models"),
+                          (401, "the provider's model list answered HTTP 401")]:
+            pages[url] = urllib.error.HTTPError(url, code, "", {}, io.BytesIO())
+            with self.assertRaisesRegex(h.NoModelList, f"^{why}$"):
+                h.available_models(session)
+        pages[url] = {"data": []}
+        with self.assertRaisesRegex(h.NoModelList, "^the provider's model list is empty$"):
+            h.available_models(session)
+        pages[url] = ["not", "an", "object"]
+        with self.assertRaisesRegex(h.NoModelList, "isn't in a form teh can read"):
+            h.available_models(session)
         # The window, under whichever name the provider gives it (OpenRouter: context_length); a non-number is none
         pages["https://example.test/v1/models"] = {"object": "list", "data": [
             {"id": "m1", "context_length": 128_000}, {"id": "m2", "context_window": True}, {"id": 3}, "x"]}
@@ -1050,6 +1170,43 @@ class Failures(unittest.TestCase):  # expected failures end a turn with their me
         self.assertEqual(ended, "context_full")
         self.assertEqual(session.state.turn.error, "the context window is full, and compacting the conversation failed")
 
+    def test_a_certificate_that_cant_be_verified_isnt_retried_and_says_how_to_fix_it(self):
+        import ssl
+        import urllib.error
+        import urllib.request
+        error = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        error.verify_message = "unable to get local issuer certificate"
+        calls = []
+        def urlopen(req, timeout):
+            calls.append(req)
+            raise urllib.error.URLError(error)
+        self.addCleanup(setattr, urllib.request, "urlopen", urllib.request.urlopen)
+        urllib.request.urlopen = urlopen
+        ended, err = self.run_turn()
+        self.assertEqual((ended, len(calls)), ("error", 1))  # once: a retry can't help
+        self.assertNotIn("retrying", err)
+        self.assertIn("Python couldn't verify the server's certificate (unable to get local issuer certificate): ",
+                      session.state.turn.error)
+        self.addCleanup(setattr, sys, "platform", sys.platform)
+        sys.platform = "darwin"  # python.org's Python for macOS: its Install Certificates script
+        self.assertIn('run "Install Certificates.command" in /Applications/Python', h.network_problem(error))
+        sys.platform = "linux"
+        self.assertIn("install the system's CA certificates, or set SSL_CERT_FILE", h.network_problem(error))
+        self.assertEqual(h.network_problem(urllib.error.URLError("timed out")), "network error: timed out")
+
+    def test_ctrl_c_cancels_a_chat_command_not_the_chat(self):  # e.g. while /model waits for the model list
+        import contextlib
+        import io
+        configure()
+        def interrupted(session, arg):
+            raise KeyboardInterrupt
+        self.addCleanup(h.CHAT_COMMANDS.__setitem__, "/model", h.CHAT_COMMANDS["/model"])
+        h.CHAT_COMMANDS["/model"] = interrupted
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            h.run_chat_command(session, "/model", "x")  # no KeyboardInterrupt out of it
+        self.assertEqual(err.getvalue(), "\n[cancelled] /model\n")
+
     def test_a_reply_that_isnt_json(self):
         configure()
         with self.assertRaisesRegex(h.APIError, "the provider's reply isn't JSON: <html>"):
@@ -1134,6 +1291,12 @@ class Compaction(unittest.TestCase):
                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": "a.txt"}]}]
         self.assertEqual(h.transcript(msgs), self.TRANSCRIPT)
 
+    def test_transcript_of_a_call_without_a_command(self):  # cut off by max_tokens (arguments kept as {})
+        calls = [{"id": "1", "function": {"arguments": "{}"}}, {"id": "2", "function": {"arguments": "[1]"}}]
+        msgs = [{"role": "assistant", "content": None, "tool_calls": calls},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "3", "input": {}}]}]
+        self.assertEqual(h.transcript(msgs), "\n\n".join(["## command\n(no command: not run)"] * 3) + "\n")
+
 class ContextCount(unittest.TestCase):
     def test_what_was_added_since_the_last_call_counts(self):  # command output can push the next call over
         configure(TEH_CONTEXT_WINDOW="1000")
@@ -1168,8 +1331,13 @@ class WebHelper(unittest.TestCase):
         self.assertEqual(h.candidates("https://example.com/"), ["https://example.com/"])
 
     def test_request_options(self):
-        r = h.request_options(["example.com", "word"])
+        r = h.request_options(["https://example.com", "word"])
         self.assertEqual((r.url, r.words, r.plain), ("https://example.com", ["word"], True))
+        self.assertEqual(h.request_options(["HTTP://localhost:8080/api"]).url, "HTTP://localhost:8080/api")
+        # The scheme is never guessed: a local server usually serves http://, a public one https://
+        for url in ("example.com", "localhost:8080/api", "ftp://example.com", "file:///etc/passwd"):
+            with self.assertRaisesRegex(SystemExit, f"the URL must start with http:// or https://, not '{url}'"):
+                h.request_options([url, "word"])
         r = h.request_options(["-H", "Accept: text/plain", "https://e.com/api", "--json", "{}", "x"])
         self.assertEqual((r.url, r.words, r.plain, r.data), ("https://e.com/api", ["x"], False, b"{}"))
         self.assertEqual(r.headers, {"content-type": "application/json", "accept": "text/plain"})  # -H wins
@@ -1305,6 +1473,14 @@ class Search(unittest.TestCase):
         self.assertTrue(0 < waits[0] <= 0.25, waits)
         h.pace_host("https://example.com/")                               # another site: no wait
         self.assertEqual(len(waits), 1)
+
+    def test_saved_pages_have_a_file_each(self):  # long URLs that differ only past the name's cut too
+        long = "https://api.example.com/v1/search/a/long/path/segment/that/goes/on/and/on/and/on?query=tea&page="
+        first, second = h.save_page(long + "1", "one"), h.save_page(long + "2", "two")
+        self.assertNotEqual(first, second)
+        self.assertEqual((first.read_text(), second.read_text()), ("one", "two"))
+        self.assertLessEqual(len(first.name), 84)  # 80 and .txt
+        self.assertEqual(h.save_page("https://e.com/a?b=1", "x").name, "e-com-a-b-1.txt")  # a short one: as it was
 
     def test_contact_only_to_sites_that_ask_for_it(self):  # whatever WEB_CONTACT is set to in teh.py
         self.addCleanup(setattr, h, "WEB_CONTACT", h.WEB_CONTACT)

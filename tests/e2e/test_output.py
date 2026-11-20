@@ -49,8 +49,13 @@ s.check("token budget reached -> 5, with the budget on the status line", r.code 
         and r.err.count("· fake ·") == 1 and "Σ 1,238,888 (1,000,000 cached | 2,000,000 budget) · ctx" in r.err
         and "token budget reached: 1,238,888 tokens used, and the next call would need about 1,238," in r.err
         and " more (TEH_TOKEN_BUDGET=2,000,000, for the whole run)" in r.err)
-code = s.ctrl_c(1.5, "go", env={"TEH_BASE_URL": "http://127.0.0.1:8768", "TEH_MODEL": "m"})
+# Pressed 1.5s into a 3.5s wait for the reply: teh stops at once, not when the reply comes (on Windows, a network
+# read can't be interrupted, so teh waits for it in a thread of its own)
+code, after = s.ctrl_c(1.5, "go", env={"TEH_BASE_URL": "http://127.0.0.1:8768", "TEH_MODEL": "m"})
 s.check(f"cancelled (Ctrl+C) -> 130 (got {code})", str(code) == "130")
+s.check(f"Ctrl+C while waiting for a reply stops teh at once (in {after if after is None else round(after, 2)}s, "
+        "the reply was 2s away)",
+        after is not None and after < 1.2)
 
 section("no terminal or console")
 # Started without one (as by cron, a scheduled task or a service), with no TEH_AUTO: nobody can approve a command

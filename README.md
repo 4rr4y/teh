@@ -15,7 +15,7 @@ More details in [DESIGN.md](DESIGN.md).
 
 ## Install
 
-1. Install Python 3.10 or later.
+1. Install Python 3.10 or later. On macOS, if it's from python.org, also run `Install Certificates.command` in its folder under `/Applications`, or teh can't connect.
 2. Download `teh.py` from the [latest release](https://github.com/4rr4y/teh/releases/latest)
 3. `python3 teh.py` (on Windows, `python teh.py`). Or clone the repository:
 

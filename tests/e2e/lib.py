@@ -162,7 +162,8 @@ class Suite:
                       p.stderr.decode(ENCODING, "replace").replace("\r\n", "\n"), time.monotonic() - start)
 
     def ctrl_c(self, seconds, *args, env=None):
-        """Run teh, press Ctrl+C after seconds, and return its exit code ("hung" if it didn't exit)."""
+        """Run teh, press Ctrl+C after seconds; return (its exit code, or "hung" if it didn't exit; the seconds it took
+        to exit after the press, or None)."""
         if WINDOWS:
             # Windows has no SIGINT for one process: Ctrl+C goes to every process on a console. So ctrl_c.py runs teh
             # in a (hidden) console of its own, and presses Ctrl+C there
@@ -171,16 +172,18 @@ class Suite:
             p = subprocess.run([PY, "-B", str(TESTS / "ctrl_c.py"), str(seconds), H, *args], capture_output=True,
                                text=True, timeout=60, env=base_env(**(env or {})),
                                creationflags=subprocess.CREATE_NEW_CONSOLE, startupinfo=info, check=False)
-            return p.stdout.strip() or p.stderr.strip()[-200:]
+            code, _, after = p.stdout.strip().partition(" ")
+            return (code, float(after)) if after else (p.stderr.strip()[-200:], None)
         p = subprocess.Popen([PY, "-B", H, *args], env=base_env(**(env or {})), stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(seconds)
         p.send_signal(signal.SIGINT)
+        pressed = time.monotonic()
         try:
-            return p.wait(timeout=20)
+            return p.wait(timeout=20), time.monotonic() - pressed
         except subprocess.TimeoutExpired:
             p.kill()
-            return "hung"
+            return "hung", None
 
     def pty(self, *inputs, cwd=None, **env):
         """Unix only: run teh's chat in a pseudo-terminal, typing these inputs at its prompts; return all it showed."""
