@@ -180,6 +180,86 @@ class Settings(unittest.TestCase):
         self.assertEqual(h.cached_tokens({"cached_tokens": 7}), 7)
         self.assertEqual(h.cached_tokens({"prompt_tokens_details": None}), 0)
 
+class Profiles(unittest.TestCase):  # TEH_PROFILE_FILE and TEH_PROFILE: settings kept in a file, one section each
+    PROFILES = """[default]
+TEH_BASE_URL = opencode-go
+TEH_MODEL = deepseek-v4.1-flash
+TEH_API_KEY = "sk-with-%-and-quotes"
+
+[claude]
+teh_base_url = anthropic
+TEH_MODEL = claude-opus-5-5
+TEH_EFFORT = high
+
+[DEFAULT]
+TEH_ROLE = shared with no one
+"""
+
+    def file(self, text=PROFILES):  # a profile file -> its path
+        import tempfile
+        path = Path(tempfile.mkdtemp(), "profiles.ini")
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def profile(self, **environ):  # with_profile(environ) -> (the settings, the profile shown, the warnings)
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            settings, shown = h.with_profile(environ)
+        return settings, shown, err.getvalue()
+
+    def test_none_unless_a_file_is_named(self):  # never a file teh finds by itself
+        self.assertEqual(self.profile(TEH_MODEL="m"), ({"TEH_MODEL": "m"}, "", ""))
+        with self.assertRaisesRegex(SystemExit, "TEH_PROFILE=claude needs TEH_PROFILE_FILE"):
+            h.with_profile({"TEH_PROFILE": "claude"})
+
+    def test_default_and_named_profiles(self):
+        path = self.file()
+        settings, shown, err = self.profile(TEH_PROFILE_FILE=path)
+        self.assertEqual((settings["TEH_BASE_URL"], settings["TEH_MODEL"], shown, err),
+                         ("opencode-go", "deepseek-v4.1-flash", f"default ({path})", ""))
+        self.assertEqual(settings["TEH_API_KEY"], "sk-with-%-and-quotes")  # quotes dropped, % kept as it is
+        settings, shown, _ = self.profile(TEH_PROFILE_FILE=path, TEH_PROFILE="claude")
+        self.assertEqual((settings["TEH_BASE_URL"], settings["TEH_EFFORT"], shown),  # names in any case
+                         ("anthropic", "high", f"claude ({path})"))
+        self.assertNotIn("TEH_ROLE", settings)  # [DEFAULT] is a profile like any other, not shared
+        self.assertNotIn("TEH_API_KEY", settings)
+
+    def test_the_environment_wins(self):
+        path = self.file()
+        settings, _, _ = self.profile(TEH_PROFILE_FILE=path, TEH_PROFILE="claude", TEH_EFFORT="low", TEH_MODEL=" ")
+        self.assertEqual(settings["TEH_EFFORT"], "low")
+        self.assertEqual(settings["TEH_MODEL"], "claude-opus-5-5")  # set but blank: as if not set
+
+    def test_what_a_profile_cant_hold_is_left_out(self):
+        path = self.file("[default]\nTEH_MODLE = m\nTEH_PROFILE = other\nMODEL = x\nTEH_MODEL = m\n")
+        settings, _, err = self.profile(TEH_PROFILE_FILE=path)
+        self.assertEqual({k: v for k, v in settings.items() if k != "TEH_PROFILE_FILE"}, {"TEH_MODEL": "m"})
+        self.assertIn(f"· unknown setting TEH_MODLE in profile default ({path}): did you mean TEH_MODEL?", err)
+        self.assertIn(f"· unknown setting MODEL in profile default ({path})", err)
+        self.assertIn(f"· TEH_PROFILE in profile default ({path}) is left out: set it in the environment", err)
+
+    def test_bad_files_and_names(self):
+        path = self.file()
+        with self.assertRaisesRegex(SystemExit, r"there's no profile 'claud' in .* \(its profiles: default, claude, "
+                                                r"DEFAULT\); did you mean claude\?"):
+            h.with_profile({"TEH_PROFILE_FILE": path, "TEH_PROFILE": "claud"})
+        with self.assertRaisesRegex(SystemExit, "can't be read"):
+            h.with_profile({"TEH_PROFILE_FILE": path + ".missing"})
+        with self.assertRaisesRegex(SystemExit, "isn't a profile file"):
+            h.with_profile({"TEH_PROFILE_FILE": self.file("TEH_MODEL = no section\n")})
+        bom = self.file()  # Notepad's byte-order mark
+        Path(bom).write_bytes(b"\xef\xbb\xbf" + Path(bom).read_bytes())
+        self.assertEqual(self.profile(TEH_PROFILE_FILE=bom)[0]["TEH_MODEL"], "deepseek-v4.1-flash")
+
+    def test_a_session_from_a_profile(self):  # the key reaches the provider, never the model's commands
+        session = h.start_session({"TEH_PROFILE_FILE": self.file(), "PATH": os.environ.get("PATH", "")})
+        self.assertEqual((session.cfg.model, session.cfg.headers["authorization"]),
+                         ("deepseek-v4.1-flash", "Bearer sk-with-%-and-quotes"))
+        self.assertTrue(session.cfg.profile.startswith("default ("))
+        self.assertNotIn("TEH_API_KEY", session.env.command_env)
+
 class Harness(unittest.TestCase):
     def test_parse_args(self):
         self.assertEqual(h.parse_args('{"command": "ls"}'), {"command": "ls"})

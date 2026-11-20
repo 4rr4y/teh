@@ -24,6 +24,7 @@ from __future__ import annotations
 import atexit
 import base64
 import codecs
+import configparser
 import contextlib
 import dataclasses
 import difflib
@@ -267,6 +268,7 @@ class Config:
     output_limit: int      # characters of a command's output the model sees; the rest is saved (see clip)
     quirks: dict           # this provider's differences (provider_quirks); the format's are in FORMATS
     headers: dict          # sent with every request (with the prompt-cache session's, see cache_headers)
+    profile: str = ""      # the profile in use, as the startup segment shows it ("" for none; see with_profile)
 
     @property
     def api(self) -> APIFormat:
@@ -411,6 +413,9 @@ SETTINGS = {
     # Read by load_config: its default depends on the URL
     "TEH_FORMAT": Setting("", None, "<format>",
                           "API format, anthropic or openai (default: anthropic if the URL contains it)"),
+    # Read by with_profile, before the rest: they say where the others are
+    "TEH_PROFILE_FILE": Setting("", None, "<path>", "read settings from this profile file (see the README)"),
+    "TEH_PROFILE": Setting("", None, "<name>", "the profile in TEH_PROFILE_FILE to use (default: default)"),
     # Set by teh itself, for the web helper
     "TEH_SCRATCH": Setting(),
 }
@@ -430,11 +435,74 @@ USAGE = (ART + "\n" + __doc__.lstrip("\n").replace(
     "options:   (generated from the SETTINGS table: one line for each setting it lists)", options_text())
     + "\n" + PROVIDER_LIST)
 
+def did_you_mean(name, names):
+    """Return ": did you mean <the closest of names>?" for a misspelt name, or "" when none is close."""
+    guess = difflib.get_close_matches(name, names, n=1)
+    return f": did you mean {guess[0]}?" if guess else ""
+
 def check_names(environ):
     """Warn about TEH_ variables teh doesn't read: a misspelt one (TEH_MODLE) would otherwise be silently ignored."""
     for name in sorted(n for n in environ if n.startswith("TEH_") and n not in SETTINGS):
-        guess = difflib.get_close_matches(name, SETTINGS, n=1)
-        print(f"· unknown setting {name}" + (f": did you mean {guess[0]}?" if guess else ""), file=sys.stderr)
+        print(f"· unknown setting {name}{did_you_mean(name, SETTINGS)}", file=sys.stderr)
+
+# ===== Profiles: settings kept in a file, one section per setup =====================================================
+# TEH_PROFILE_FILE names the file, and TEH_PROFILE the section in it ([default] when unset); a setting in the
+# environment wins over the profile's. The file is only ever the one TEH_PROFILE_FILE names, never one teh finds by
+# itself: a profile file in a project's folder could send your key to a server of its choosing.
+DEFAULT_PROFILE = "default"
+# Settings a profile can't hold: those that choose the profile, and the one teh sets itself
+NOT_IN_PROFILES = {"TEH_PROFILE", "TEH_PROFILE_FILE", "TEH_SCRATCH"}
+
+def unquote(value):
+    """Return a profile value without the quotes around it, if it has a matching pair (as a shell would need)."""
+    value = value.strip()
+    return value[1:-1] if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'" else value
+
+def read_profile(path, name):
+    """Return the settings in profile name of the file at path, {TEH_ name: value}; exit, saying why, when the file
+    can't be read or has no such profile."""
+    # No interpolation: a % in a key or a URL is just a %. A default section named "" (which can't be written): no
+    # section's settings are shared with the others, as [DEFAULT]'s would be
+    parser = configparser.ConfigParser(interpolation=None, default_section="")
+    # Names as written: configparser would lowercase them
+    parser.optionxform = str
+    try:
+        # utf-8-sig: Notepad may start the file with a byte-order mark
+        with open(path, encoding="utf-8-sig") as f:
+            parser.read_file(f)
+    except OSError as e:
+        raise SystemExit(f"TEH_PROFILE_FILE {path} can't be read: {e.strerror or e}") from None
+    except configparser.Error as e:
+        raise SystemExit(f"TEH_PROFILE_FILE {path} isn't a profile file: {e}") from None
+    if not parser.has_section(name):
+        profiles = ", ".join(parser.sections()) or "none"
+        raise SystemExit(f"there's no profile {name!r} in {path} (its profiles: {profiles})"
+                         + did_you_mean(name, parser.sections()).replace(": ", "; ", 1))
+    return {key.strip().upper(): unquote(value) for key, value in parser.items(name)}
+
+def with_profile(environ):
+    """Return environ with the settings of the chosen profile under it (see the section's comment), and the profile
+    as the startup segment shows it ("" for none); exit when TEH_PROFILE has no file, or the file is bad.
+
+    A setting in the profile that teh doesn't know, or that a profile can't hold, is warned about and left out.
+    """
+    path, name = (environ.get("TEH_PROFILE_FILE") or "").strip(), (environ.get("TEH_PROFILE") or "").strip()
+    if not path:
+        if name:
+            raise SystemExit(f"TEH_PROFILE={name} needs TEH_PROFILE_FILE: the path of the file it's in")
+        return environ, ""
+    # ~ for the home folder, which Windows' shells don't expand in a variable's value
+    path, name = os.path.expanduser(path), name or DEFAULT_PROFILE
+    profile, where = {}, f" in profile {name} ({path})"
+    for key, value in read_profile(path, name).items():
+        if key in NOT_IN_PROFILES:
+            print(f"· {key}{where} is left out: set it in the environment", file=sys.stderr)
+        elif key not in SETTINGS:
+            print(f"· unknown setting {key}{where}{did_you_mean(key, SETTINGS)}", file=sys.stderr)
+        else:
+            profile[key] = value
+    # The environment wins, unless a variable is set but blank, which reads as not set
+    return {**profile, **{k: v for k, v in environ.items() if v.strip() or k not in profile}}, f"{name} ({path})"
 
 def choice(environ, name, options, default):
     """Return a setting with a few allowed values, lowercased; exit when it's none of them."""
@@ -443,8 +511,11 @@ def choice(environ, name, options, default):
         raise SystemExit(f"{name} must be {' or '.join(options)}, not {environ.get(name)!r}")
     return value
 
-def load_config(environ):
-    """Build the Config from the environment variables; exit with the usage text when a required one is missing."""
+def load_config(environ, profile=""):
+    """Build the Config from the environment variables; exit with the usage text when a required one is missing.
+
+    profile: the profile they include, as the startup segment shows it (see with_profile).
+    """
     get = environ.get
     base = get("TEH_BASE_URL", "").strip()
     base = PROVIDERS.get(base.lower(), base).rstrip("/")
@@ -460,7 +531,7 @@ def load_config(environ):
     if key:
         headers[quirks["key_header"]] = f"Bearer {key}" if quirks["key_header"] == "authorization" else key
     return Config(base=base, provider=provider_name(base), model=model, fmt=fmt, quirks=quirks, headers=headers,
-                  **read_settings(environ, "cfg"))
+                  profile=profile, **read_settings(environ, "cfg"))
 
 def wants_summary(model, fmt, thinking):
     """Whether to ask for a reasoning summary: only when it's shown (TEH_THINKING), and only for SUMMARY_MODELS."""
@@ -489,8 +560,11 @@ def start_state(cfg, environ):
                  context_window=cfg.context_window, **read_settings(environ, "state"))
 
 def start_session(environ):
-    """Start a session from the environment variables: its settings, environment and state; exits when they're bad."""
-    cfg = load_config(environ)
+    """Start a session from the environment variables, and the profile they name: its settings, environment and
+    state; exits when they're bad."""
+    environ, profile = with_profile(environ)
+    check_names(environ)
+    cfg = load_config(environ, profile)
     session = Session(cfg, setup_environment(cfg, environ), start_state(cfg, environ))
     new_cache_session(session)
     return session
@@ -1724,7 +1798,6 @@ def main():
     if sys.argv[1:2] == ["--version"]:
         print(f"teh {__version__}")
         return 0
-    check_names(os.environ)
     session = start_session(os.environ)
     cfg, env, state = session.cfg, session.env, session.state
     setup_terminal()
@@ -1792,6 +1865,7 @@ def startup_segment(session):
   shell    {env.shell_kind} ({env.shell})
   cwd      {os.getcwd()}
   scratch  {env.scratch} (deleted on exit)
+  profile  {cfg.profile or 'none (TEH_PROFILE_FILE not set)'}
   agents   {env.agents_info}
   api      {cfg.base} ({cfg.fmt} format)
   cache    {cache_info(session)}

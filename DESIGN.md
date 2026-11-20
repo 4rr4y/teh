@@ -282,6 +282,15 @@ At startup, `teh` warns about any `TEH_` variable it doesn't know, e.g. `unknown
 
 The chat's startup segment shows what `teh` found: OS, shell, working directory, the session's scratch folder, `AGENTS.md`, API, caching and model settings, the model's role, and any budgets.
 
+## Profiles
+
+A profile file keeps settings as INI sections, read with Python's own `configparser`, so there's still nothing to install. The choices behind it:
+- **Only the file `TEH_PROFILE_FILE` names is read,** never one found by itself: a profile file in a project's folder could otherwise send your requests, and your key, to a server of its choosing.
+- **The environment wins** over the profile for each setting, so a one-off change needs no edit; a variable set but blank reads as not set.
+- **The same names and checks as the environment:** a profile holds `TEH_` settings, a misspelt one gets the same "did you mean" warning and is left out, and so are `TEH_PROFILE` and `TEH_PROFILE_FILE` (they choose the profile, so they belong in the environment).
+- **No surprises from `configparser`:** names keep their case, `%` is just a character (keys and URLs have them), and `[DEFAULT]` is a profile like any other rather than settings shared by all. A value may be quoted, as in a shell.
+- **The profile in use is on the startup segment,** so it's never a mystery where a setting came from. The model's commands never see a profile's settings: they only ever get the environment `teh` started with, without its `TEH_` variables.
+
 ## The status line
 
 ```
@@ -393,7 +402,7 @@ $env:TEH_OUTPUT = $null
 
 Windows PowerShell's `Get-Content` reads a file without a byte-order mark in the ANSI code page, so `-Encoding UTF8` keeps UTF-8 files' non-English text whole (PowerShell 7 reads UTF-8 by default). Its `Set-Content` writes the ANSI code page; add `-Encoding UTF8` for UTF-8 there too.
 
-**Several setups.** cmd: a `.cmd` file per setup, in a folder on `PATH`; `setlocal` keeps its settings from leaking into your session:
+**Several setups.** A [profile file](README.md#profiles) works the same in every shell. Without one, in cmd: a `.cmd` file per setup, in a folder on `PATH`; `setlocal` keeps its settings from leaking into your session:
 
 ```bat
 @echo off

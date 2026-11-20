@@ -86,7 +86,7 @@ To save tokens: `/clear` between unrelated tasks, `/compact` in long ones, `/und
 
 ## Settings
 
-All settings are environment variables. Only the first two are required.
+All settings are environment variables, or kept in a [profile](#profiles). Only the first two are required.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -108,8 +108,57 @@ All settings are environment variables. Only the first two are required.
 | `TEH_TOKEN_BUDGET` | `0` (no limit) | Number of tokens the whole run may use |
 | `TEH_TURN_BUDGET` | `0` (no limit) | Number of model calls for one prompt |
 | `TEH_SHELL` | the shell you're in | Shell to run commands in: `bash`, `zsh`, `sh`, `pwsh`, `powershell`, `cmd`, … |
+| `TEH_PROFILE_FILE` | none | Path of a [profile](#profiles) file to read settings from |
+| `TEH_PROFILE` | `default` | Which profile in `TEH_PROFILE_FILE` to use |
 
 A misspelt setting gets a warning with a suggestion (`TEH_MODLE: did you mean TEH_MODEL?`), and a value `teh` can't use stops it with a clear message.
+
+## Profiles
+
+To avoid setting the same variables every time, keep each setup as a section of one file:
+
+```ini
+[default]
+TEH_BASE_URL = opencode-go
+TEH_MODEL = deepseek-v4.1-flash
+TEH_API_KEY = <your key>
+
+[claude]
+TEH_BASE_URL = anthropic
+TEH_MODEL = claude-opus-5-5
+TEH_API_KEY = <your key>
+TEH_EFFORT = high
+
+[local]
+TEH_BASE_URL = ollama
+TEH_MODEL = qwen3
+TEH_CONTEXT_WINDOW = 32000
+```
+
+Point `TEH_PROFILE_FILE` at it, once (e.g. in `~/.bashrc`), and pick a profile with `TEH_PROFILE`:
+
+```sh
+# sh
+export TEH_PROFILE_FILE=~/.config/teh/profiles.ini
+teh                                       # the [default] profile
+TEH_PROFILE=claude teh                    # the [claude] profile
+TEH_PROFILE=local TEH_EFFORT=low teh "summarise notes.txt"   # a variable you set wins over the profile
+```
+
+```bat
+rem Windows, cmd
+set "TEH_PROFILE_FILE=%APPDATA%\teh\profiles.ini"
+set "TEH_PROFILE=claude" & teh
+```
+
+```powershell
+# Windows, PowerShell
+$env:TEH_PROFILE_FILE = "$env:APPDATA\teh\profiles.ini"
+$env:TEH_PROFILE = "claude"; teh
+```
+
+- `teh` reads only the file `TEH_PROFILE_FILE` names, never one it finds by itself, and the chat's startup shows which profile is in use.
+- The file holds your keys: keep it private (`chmod 600` on Linux and macOS).
 
 ## Providers
 
@@ -135,12 +184,7 @@ TEH_OUTPUT=json TEH_AUTO=1 teh "how many Python files are here?" | jq -r .answer
 
 Without a terminal (CI, cron), set `TEH_AUTO=1`: nobody can approve commands. The exit code says how the run ended: 0 done, 1 error, 2 refused, 3 context full, 4 reply cut off, 5 budget reached, 130 cancelled. `TEH_OUTPUT=json` prints the whole result as one JSON object; both are described in [One-shot results](DESIGN.md#one-shot-results), and the cmd and PowerShell versions of these examples in [Windows](DESIGN.md#windows).
 
-To keep several setups, give each a short command, e.g. in `~/.bashrc`:
-
-```sh
-alias teh-claude='TEH_BASE_URL=anthropic TEH_MODEL=claude-opus-5-5 TEH_API_KEY=$(cat ~/.keys/anthropic) teh'
-alias teh-local='TEH_BASE_URL=ollama TEH_MODEL=qwen3 TEH_CONTEXT_WINDOW=32000 teh'   # on your machine, no key
-```
+To keep several setups, use [profiles](#profiles).
 
 ## Safety
 
